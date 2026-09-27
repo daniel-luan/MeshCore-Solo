@@ -120,13 +120,13 @@ Applies to every board: each binary serves the companion app over **both** BLE a
 
 ## Hardware setup — Heltec V3 / V4
 
-A single button can't drive the solo UI, and neither Heltec board has one built in. Both stock builds enable an **M5Stack CardKB** and a **wired joystick** on these pins — V3 and V4 are pin-compatible, so the assignment is identical:
+A single PRG button can't drive the solo UI. Both Solo builds enable an **M5Stack CardKB** and a **wired joystick** by default. The joystick's Up pin differs between V3 and V4:
 
 | Function | GPIO | Notes |
 | -------- | :--: | ----- |
 | CardKB SDA | **3** | second I2C bus (`Wire1`) — *not* the OLED's 17/18 |
 | CardKB SCL | **4** | |
-| Joystick UP | **23** | |
+| Joystick UP | **16 (V4)** / **2 (V3)** | V4 GPIO16 is on the small additional-pin header; V3 GPIO2 is on J3 |
 | Joystick DOWN | **6** | |
 | Joystick LEFT | **47** | |
 | Joystick RIGHT | **48** | |
@@ -136,7 +136,7 @@ A single button can't drive the solo UI, and neither Heltec board has one built 
 Each joystick contact simply shorts its pin to GND — the firmware enables the internal pull-ups, so no external resistors are needed. CardKB needs power and ground alongside SDA/SCL; check your unit's own voltage rating before picking a rail.
 
 > [!NOTE]
-> This assignment is confirmed working on real **V4** hardware. V3 inherits it because Heltec documents the two boards as pin-compatible, but it hasn't been verified on a physical V3 — worth a continuity check against your own module before soldering.
+> The old Solo builds assigned Up to GPIO23, which does not exist on the ESP32-S3. The corrected Up pins follow Heltec's pin tables; this revised joystick wiring has not yet been checked on physical hardware. Check your board revision before soldering.
 
 Either device is enough on its own — unwired pins read as not-pressed, and a missing CardKB just isn't detected at boot. For **CardKB-only**, wire just SDA/SCL and set Settings › Keyboard › **Ext. KB = Compact**, which needs no joystick at all.
 

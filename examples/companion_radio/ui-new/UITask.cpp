@@ -2025,7 +2025,17 @@ void UITask::showAlert(const char* text, int duration_millis) {
   _alert_expiry = millis() + duration_millis;
 }
 
+static bool channelNotificationMuted(const NodePrefs* prefs, int channel_idx) {
+  if (!prefs || channel_idx < 0 || channel_idx >= 64) return false;
+  uint64_t mask = 1ULL << channel_idx;
+  return (prefs->ch_notif_override & mask) && (prefs->ch_notif_muted & mask);
+}
+
 void UITask::notify(UIEventType t) {
+#ifdef PIN_VIBRATION
+  bool muted_channel = t == UIEventType::channelMessage &&
+                       channelNotificationMuted(_node_prefs, _last_notif_ch_idx);
+#endif
 #if defined(PIN_BUZZER)
 {
   SoundNotifier sn(buzzer, _node_prefs, _notif_mel_buf, sizeof(_notif_mel_buf));
@@ -2036,7 +2046,6 @@ void UITask::notify(UIEventType t) {
     break;
   case UIEventType::channelMessage:
     sn.playCH(_last_notif_ch_idx);
-    _last_notif_ch_idx = -1;
     break;
   case UIEventType::roomMessage:
     // Rooms have many authors and no per-room melody pref, so use the default DM
@@ -2059,7 +2068,7 @@ void UITask::notify(UIEventType t) {
 
 #ifdef PIN_VIBRATION
   // Trigger vibration for all UI events except none
-  if (t != UIEventType::none) {
+  if (t != UIEventType::none && !muted_channel) {
     vibration.trigger();
   }
 #endif
@@ -2092,6 +2101,13 @@ void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, i
       memcpy(_dm_unread_table[empty_slot].prefix, pub_key, 4);
       _dm_unread_table[empty_slot].count = 1;
     }
+  }
+
+  bool muted_channel = contact_type == 0 && channelNotificationMuted(_node_prefs, _last_notif_ch_idx);
+  _last_notif_ch_idx = -1;
+  if (muted_channel) {
+    if (_display != NULL && _display->isOn()) _next_refresh = 100;
+    return;
   }
 
   char alert_buf[80];

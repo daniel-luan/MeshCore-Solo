@@ -145,7 +145,7 @@ In the **Rooms** list the context menu instead offers:
 | Item                      | Action                                                                |
 | ------------------------- | --------------------------------------------------------------------- |
 | Mark all read             | Clears all unread for this channel                                    |
-| Notif: Default / OFF / ON | Per-channel notification override — **LEFT/RIGHT** or **Enter** to cycle           |
+| Notif: Default / OFF / ON | Per-channel notification override — **LEFT/RIGHT** or **Enter** to cycle. **OFF** hides the on-device message banner, prevents screen wake and silences sound/vibration for this channel; messages still appear in history and unread counts. |
 | Melody: Global / M1 / M2  | Per-channel melody override — **LEFT/RIGHT** or **Enter** to cycle                 |
 | Fav: ON / OFF             | Add or remove this channel from favourites — **LEFT/RIGHT** or **Enter** to toggle |
 | Scope: <name>             | **Enter** opens a picker over the shared scope list (Settings › Radio › Scope) — `*` sends this channel unscoped, any named scope tags its flood traffic with that region. Each channel keeps its own pick, matching the phone app's per-channel region picker. |

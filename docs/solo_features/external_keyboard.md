@@ -104,15 +104,16 @@ external resistors are needed.
 ## Wiring (Heltec V3 / V4)
 
 Neither board ships with a joystick or a keyboard header, so both are soldered to
-free GPIOs. V3 and V4 are pin-compatible per Heltec's documentation and the solo
-builds use the same assignment for both — **confirmed working on real V4
-hardware**; still worth checking against your own V3 module before soldering.
+free GPIOs. The V3 and V4 Solo builds use different Up pins because GPIO2
+controls the LoRa PA on V4. The corrected assignments follow Heltec's pin tables
+and have not yet been checked on physical hardware; check your board revision
+before soldering.
 
 | Function | GPIO | Notes |
 | -------- | ---- | ----- |
 | CardKB SDA | 3 | second I2C bus (`Wire1`) — *not* the OLED's 17/18 |
 | CardKB SCL | 4 | |
-| Joystick UP | 23 | |
+| Joystick UP | **16 on V4 / 2 on V3** | V4 GPIO16 is on the small additional-pin header; V3 GPIO2 is on J3. GPIO23 does not exist on either board's ESP32-S3. |
 | Joystick DOWN | 6 | |
 | Joystick LEFT | 47 | |
 | Joystick RIGHT | 48 | |
