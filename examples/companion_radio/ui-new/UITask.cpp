@@ -297,6 +297,22 @@ static int drawClockTime(DisplayDriver& d, int top_y, const struct tm* ti,
   return top_y + lh2 + 2;
 }
 
+static void formatUnreadOverview(char* buf, size_t len, const UITask* task, DisplayDriver& display) {
+  int dm = task->getDMUnreadTotal();
+  int channels = task->getChannelUnreadCount();
+  int rooms = task->getRoomUnreadCount();
+  if (rooms)
+    snprintf(buf, len, "DM %d  Ch %d  Rm %d", dm, channels, rooms);
+  else
+    snprintf(buf, len, "DM %d  Ch %d", dm, channels);
+  if (display.getTextWidth(buf) > display.width()) {
+    if (rooms) snprintf(buf, len, "D%d C%d R%d", dm, channels, rooms);
+    else       snprintf(buf, len, "D%d C%d", dm, channels);
+  }
+  if (display.getTextWidth(buf) > display.width())
+    snprintf(buf, len, "%d unread", dm + channels + rooms);
+}
+
 // ── HomeScreen ────────────────────────────────────────────────────────────────
 // Forward declaration to be able to call formatDashVal from HomeScreen::render()
 static void formatDashVal(uint8_t field, char* val, int val_len, uint16_t batt_mv,
@@ -865,8 +881,28 @@ public:
         int dash0  = sep_y + display.sepH() + 2;
         display.fillRect(0, sep_y, display.width(), display.sepH());
 
+        // An unconfigured clock gets a useful overview. Configured fields keep
+        // their existing meaning and layout.
+        bool default_overview = _node_prefs &&
+          _node_prefs->dashboard_fields[0] == DASH_NONE &&
+          _node_prefs->dashboard_fields[1] == DASH_NONE &&
+          _node_prefs->dashboard_fields[2] == DASH_NONE;
+        if (default_overview) {
+          char unread[32], batt[20], contacts[16];
+          formatUnreadOverview(unread, sizeof(unread), _task, display);
+          uint16_t mv = _task->getBattMilliVolts();
+          if (mv) snprintf(batt, sizeof(batt), "%u.%02uV", mv / 1000, (mv % 1000) / 10);
+          else strcpy(batt, "--");
+          snprintf(contacts, sizeof(contacts), "%d", the_mesh.getNumContacts());
+          display.drawTextEllipsized(0, dash0, display.width(), unread);
+          display.setCursor(0, dash0 + step); display.print("Batt");
+          display.drawTextRightAlign(display.width() - 1, dash0 + step, batt);
+          display.setCursor(0, dash0 + step * 2); display.print("Contacts");
+          display.drawTextRightAlign(display.width() - 1, dash0 + step * 2, contacts);
+        }
+
         // dashboard data fields
-        if (_node_prefs) {
+        if (_node_prefs && !default_overview) {
           refresh_sensors();
           const int FIELD_Y[3] = { dash0, dash0 + step, dash0 + step * 2 };
           for (int fi = 0; fi < 3; fi++) {
@@ -977,6 +1013,10 @@ public:
       display.setTextSize(1);
       if (unix_ts < 1000000000UL) {
         display.drawTextCentered(display.width() / 2, display.height() / 2 - step, "No time sync");
+        int total_unread = _task->getDMUnreadTotal() + _task->getChannelUnreadCount() + _task->getRoomUnreadCount();
+        char unread[20];
+        snprintf(unread, sizeof(unread), "%d unread", total_unread);
+        display.drawTextCentered(display.width() / 2, display.height() / 2, unread);
       } else {
         int8_t tz = _node_prefs ? _node_prefs->tz_offset_hours : 0;
         unix_ts += (int32_t)tz * 3600;
@@ -992,8 +1032,32 @@ public:
         display.setCursor(0, date_y);
         display.print(buf);
 
+        // On a 64-pixel OLED the date, one information row and unlock hint
+        // fill the screen. Give unread messages that row; taller screens can
+        // show both unreads and the configured dashboard values.
+        int dm_unread = _task->getDMUnreadTotal();
+        int channel_unread = _task->getChannelUnreadCount();
+        int room_unread = _task->getRoomUnreadCount();
+        bool show_unread = dm_unread + channel_unread + room_unread > 0;
+        bool unread_own_row = false;
+        if (!show_unread) {
+          if (display.getTextWidth(buf) + display.getTextWidth("0 unread") + 3 < display.width())
+            display.drawTextRightAlign(display.width() - 1, date_y, "0 unread");
+          else {
+            display.drawTextCentered(display.width() / 2, date_y + step, "0 unread");
+            unread_own_row = true;
+          }
+        }
+        bool room_for_both = date_y + step * 2 + lh < display.height() - lh - 6;
+        if (show_unread) {
+          char unread[32];
+          formatUnreadOverview(unread, sizeof(unread), _task, display);
+          int unread_y = date_y + step + (room_for_both ? step : 0);
+          display.drawTextEllipsized(0, unread_y, display.width(), unread);
+        }
+
         // Two sensor values side by side (dashboard_fields[0] and [1])
-        if (_node_prefs) {
+        if (_node_prefs && (!show_unread || room_for_both) && (!unread_own_row || room_for_both)) {
           char v0[20] = "", v1[20] = "";
           CayenneLPP* lpp_ptr = nullptr;
           uint8_t f0 = _node_prefs->dashboard_fields[0], f1 = _node_prefs->dashboard_fields[1];
@@ -1009,7 +1073,7 @@ public:
           formatDashVal(f0, v0, sizeof(v0), batt_mv, _node_prefs->low_batt_mv, unread, _node_prefs->units_imperial, lpp_ptr);
           formatDashVal(f1, v1, sizeof(v1), batt_mv, _node_prefs->low_batt_mv, unread, _node_prefs->units_imperial, lpp_ptr);
           if (v0[0] || v1[0]) {
-            int sv_y = date_y + step;
+            int sv_y = date_y + step + (unread_own_row ? step : 0);
             display.setColor(DisplayDriver::LIGHT);
             if (v0[0] && v1[0]) {
               display.setCursor(0, sv_y);

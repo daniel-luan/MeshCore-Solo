@@ -276,8 +276,8 @@ build_firmwares() {
   build_room_server_firmwares
 }
 
-# clean build dir
-rm -rf out
+# Keep artifacts from other targets and earlier builds when invoking this
+# script more than once. Each target's output files are copied in place below.
 mkdir -p out
 
 # handle script args
