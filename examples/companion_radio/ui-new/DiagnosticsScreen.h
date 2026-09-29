@@ -2,6 +2,7 @@
 #include <helpers/ui/DisplayDriver.h>
 #include <helpers/ui/UIScreen.h>
 #include <helpers/DeviceDiag.h>
+#include <helpers/DeviceTiming.h>
 #include <Arduino.h>
 #include <stdarg.h>
 #include "icons.h"
@@ -17,6 +18,7 @@ extern MyMesh the_mesh;
 //   Live   — live counters: uptime, packet counts by category (RX/TX),
 //            forwarded count, heap/stack headroom, radio signal, pool/queue
 //            depth, error flags. Hold Enter resets the counters.
+//   Timing — longest foreground calls since boot/reset, in milliseconds.
 //   System — static device identity: firmware version + build date, device
 //            model, node name, and the active radio parameters.
 //   Font   — a rendering test card: one sample line per script the UI font
@@ -30,13 +32,13 @@ class DiagnosticsScreen : public UIScreen {
   UITask* _task;
   int _scroll = 0;
   uint8_t _tab = 0;        // persists across visits (like BotScreen's _tab)
-  PopupMenu _reset_menu;   // Live tab, Hold Enter → Reset/Cancel confirm (defaults to Cancel)
+  PopupMenu _reset_menu;   // Live/Timing: Hold Enter → Reset/Cancel confirm
 
-  enum Tab : uint8_t { TAB_LIVE, TAB_SYSTEM, TAB_FONT, TAB_COUNT };
+  enum Tab : uint8_t { TAB_LIVE, TAB_TIMING, TAB_SYSTEM, TAB_FONT, TAB_COUNT };
   static const char* const TAB_LABELS[TAB_COUNT];
 
   struct Row { const char* label; char value[20]; };
-  static const int MAX_ROWS = 14;
+  static const int MAX_ROWS = 20;
   Row _rows[MAX_ROWS];
   int _row_count = 0;
 
@@ -152,6 +154,36 @@ class DiagnosticsScreen : public UIScreen {
     addRow("RXPS wd s/h", buf);
   }
 
+  void addTimingRow(const char* label, DeviceTiming::Metric metric) {
+    uint32_t us = device_timing.maxMicros(metric);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%lu.%01lu ms", (unsigned long)(us / 1000),
+             (unsigned long)((us % 1000) / 100));
+    addRow(label, buf);
+  }
+
+  void buildTimingRows() {
+    _row_count = 0;
+    addRow("Peak", "since reset");
+    addTimingRow("Mesh",     DeviceTiming::MESH_LOOP);
+    addTimingRow("Sensors",  DeviceTiming::SENSOR_LOOP);
+    addTimingRow("UI",       DeviceTiming::UI_LOOP);
+    addTimingRow("UI keys",  DeviceTiming::UI_EVENTS);
+    addTimingRow("UI poll",  DeviceTiming::UI_POLL);
+    addTimingRow("UI draw",  DeviceTiming::UI_RENDER);
+    addTimingRow("UI bg",    DeviceTiming::UI_BACKGROUND);
+    addTimingRow("Advert",   DeviceTiming::ADVERT_WRITE);
+    addTimingRow("Settings", DeviceTiming::PREFS_WRITE);
+    addTimingRow("Contacts", DeviceTiming::CONTACTS_WRITE);
+    addTimingRow("C open",   DeviceTiming::CONTACTS_OPEN);
+    addTimingRow("C data",   DeviceTiming::CONTACTS_DATA);
+    addTimingRow("C chunk",  DeviceTiming::CONTACTS_CHUNK);
+    addTimingRow("C close",  DeviceTiming::CONTACTS_CLOSE);
+    addTimingRow("C swap",   DeviceTiming::CONTACTS_REPLACE);
+    addTimingRow("USB",      DeviceTiming::USB_WRITE);
+    addTimingRow("OLED",     DeviceTiming::OLED_FLUSH);
+  }
+
   void buildSystemLines() {
     _line_count = 0;
 
@@ -243,6 +275,7 @@ public:
     tabbar::draw(display, TAB_LABELS, TAB_COUNT, _tab);
 
     switch (_tab) {
+      case TAB_TIMING: buildTimingRows(); renderRows(display); break;
       case TAB_SYSTEM: buildSystemLines(); renderLines(display); break;
       case TAB_FONT:   buildFontLines();   renderLines(display); break;
       default:         buildLiveRows();    renderRows(display);  break;
@@ -253,16 +286,21 @@ public:
     // Live counters refresh once a second; the static System/Font cards don't
     // change, so they can idle. The reset popup wants a snappier redraw.
     if (_reset_menu.active) return 50;
-    return _tab == TAB_LIVE ? 1000 : 2000;
+    return (_tab == TAB_LIVE || _tab == TAB_TIMING) ? 1000 : 2000;
   }
 
   bool handleInput(char c) override {
     if (_reset_menu.active) {
       auto res = _reset_menu.handleInput(c);
       if (res == PopupMenu::SELECTED && _reset_menu.selectedIndex() == 0) {
-        the_mesh.resetStats();     // zeroes Dispatcher per-type counters + Mesh forward count + err flags
-        radio_driver.resetStats(); // zeroes the radio's own counters, incl. RXPS watchdog soft/hard counts
-        _task->showAlert("Counters reset", 800);
+        if (_tab == TAB_TIMING) {
+          device_timing.reset();
+          _task->showToast("Times reset", 800);
+        } else {
+          the_mesh.resetStats();     // zeroes Dispatcher per-type counters + Mesh forward count + err flags
+          radio_driver.resetStats(); // zeroes the radio's own counters, incl. RXPS watchdog soft/hard counts
+          _task->showToast("Counters reset", 800);
+        }
       }
       return true;
     }
@@ -270,8 +308,8 @@ public:
     if (keyIsNext(c)) { _tab = (_tab + 1) % TAB_COUNT;            _scroll = 0; return true; }
     if (c == KEY_UP)   { if (_scroll > 0) _scroll--; return true; }
     if (c == KEY_DOWN) { _scroll++; return true; }   // clamped in render()
-    if (c == KEY_CONTEXT_MENU && _tab == TAB_LIVE) {   // Hold Enter — reset the live counters
-      _reset_menu.beginConfirm("Reset counters?", "Reset");
+    if (c == KEY_CONTEXT_MENU && (_tab == TAB_LIVE || _tab == TAB_TIMING)) {
+      _reset_menu.beginConfirm(_tab == TAB_TIMING ? "Reset times?" : "Reset counters?", "Reset");
       return true;
     }
     if (c == KEY_CANCEL) { _task->gotoToolsScreen(); return true; }
@@ -279,4 +317,4 @@ public:
   }
 };
 
-const char* const DiagnosticsScreen::TAB_LABELS[DiagnosticsScreen::TAB_COUNT] = { "Live", "System", "Font" };
+const char* const DiagnosticsScreen::TAB_LABELS[DiagnosticsScreen::TAB_COUNT] = { "Live", "Timing", "System", "Font" };

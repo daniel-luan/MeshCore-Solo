@@ -1,6 +1,7 @@
 #include "UITask.h"
 #include "SoundNotifier.h"
 #include <helpers/TxtDataHelpers.h>
+#include <helpers/DeviceTiming.h>
 #include "../MyMesh.h"
 #include "../MsgExpand.h"
 #include "../Features.h"
@@ -1490,7 +1491,7 @@ public:
     if (c == KEY_ENTER && _page == HomePage::ADVERT) {
       _task->notify(UIEventType::ack);
       if (the_mesh.advert()) {
-        _task->showAlert("Advert sent", 1000);
+        _task->showToast("Advert sent", 1000);
       } else {
         _task->showAlert("Advert failed", 1000);
       }
@@ -1986,6 +1987,13 @@ void UITask::onAdminReply(const uint8_t* pub_key, const char* text) {
   _next_refresh = 0;   // same reasoning as onRoomLoginResult above
 }
 
+void UITask::onRemoteStatus(const uint8_t* pub_key, uint16_t battery_mv, uint16_t queue_len,
+                            int16_t noise_floor, int16_t last_rssi, uint32_t uptime_secs) {
+  ((AdminScreen*)admin_screen)->onRemoteStatus(pub_key, battery_mv, queue_len,
+                                               noise_floor, last_rssi, uptime_secs);
+  _next_refresh = 0;
+}
+
 void UITask::addDMMsg(const uint8_t* pub_key, bool outgoing, const char* text, uint32_t sender_timestamp,
                       uint32_t ack_tag, uint32_t ack_deadline_ms, uint8_t resends,
                       const uint8_t* path, uint8_t path_len) {
@@ -2022,7 +2030,16 @@ void UITask::reconcileDMUnread() {
 
 void UITask::showAlert(const char* text, int duration_millis) {
   snprintf(_alert, sizeof(_alert), "%s", text);
+  _alert_toast = false;
   _alert_expiry = millis() + duration_millis;
+  _next_refresh = 0;
+}
+
+void UITask::showToast(const char* text, int duration_millis) {
+  snprintf(_alert, sizeof(_alert), "%s", text);
+  _alert_toast = true;
+  _alert_expiry = millis() + duration_millis;
+  _next_refresh = 0;
 }
 
 static bool channelNotificationMuted(const NodePrefs* prefs, int channel_idx) {
@@ -2155,6 +2172,16 @@ void UITask::userLedHandler() {
 // render path, same contract as the message views.
 void UITask::renderAlertOverlay() {
   _display->setTextSize(1);
+  if (_alert_toast) {
+    int h = _display->getLineHeight() + 4;
+    int y = _display->height() - h;
+    _display->setColor(DisplayDriver::DARK);
+    _display->fillRect(0, y, _display->width(), h);
+    _display->setColor(DisplayDriver::LIGHT);
+    _display->drawRect(0, y, _display->width(), h);
+    _display->drawTextEllipsized(4, y + 2, _display->width() - 8, _alert);
+    return;
+  }
   const int lh    = _display->getLineHeight();
   const int pad   = 3;
   const int box_w = _display->width() - 8;
@@ -2170,6 +2197,61 @@ void UITask::renderAlertOverlay() {
   _display->drawRect(box_x, box_y, box_w, box_h);
   for (int i = 0; i < nl; i++)
     _display->drawTextCentered(_display->width() / 2, box_y + pad + i * lh, s_wrap_lines[i]);
+}
+
+void UITask::setStorageBusy(bool busy, StorageActivity activity) {
+  if (_storage_busy == busy && (!busy || _storage_activity == activity)) return;
+  _storage_busy = busy;
+  _storage_activity = activity;
+  _storage_indicator_ready = false;
+  if (_display && _display->isOn()) _next_refresh = 0;
+}
+
+void UITask::showStorageBusyNow(StorageActivity activity) {
+  if (!_display || !_display->isOn()) return;
+  setStorageBusy(true, activity);
+  _display->startFrame();
+  renderStorageOverlay();
+  _display->endFrame();
+}
+
+void UITask::showStorageError(StorageActivity activity) {
+  if (activity == StorageActivity::Settings) showAlert("Settings save failed", 2500);
+  else if (activity == StorageActivity::Contacts) showAlert("Contact save failed", 2500);
+  else showAlert("Advert save failed", 2500);
+}
+
+void UITask::renderStorageOverlay() {
+  if (!_storage_busy || !_display || !_display->isOn()) return;
+  _display->setTextSize(1);
+  const char* title = "Saving contacts";
+  const char* detail = "Writing contact file";
+  if (_storage_activity == StorageActivity::Advert) {
+    title = "Saving advert";
+    detail = "For contact sharing";
+  } else if (_storage_activity == StorageActivity::Settings) {
+    title = "Saving settings";
+    detail = "Writing preferences";
+  }
+  const char* pause = "Input may pause";
+  int w = _display->getTextWidth(title);
+  if (_display->getTextWidth(detail) > w) w = _display->getTextWidth(detail);
+  if (_display->getTextWidth(pause) > w) w = _display->getTextWidth(pause);
+  w += 10;
+  if (w > _display->width() - 4) w = _display->width() - 4;
+  int h = _display->getLineHeight() * 3 + 8;
+  int x = (_display->width() - w) / 2;
+  int y = _display->height() - h - 2;
+  if (y < 0) y = 0;
+  _display->setColor(DisplayDriver::DARK);
+  _display->fillRect(x, y, w, h);
+  _display->setColor(DisplayDriver::LIGHT);
+  _display->drawRect(x, y, w, h);
+  int line_y = y + 3;
+  _display->drawTextCentered(_display->width() / 2, line_y, title);
+  _display->drawTextCentered(_display->width() / 2, line_y + _display->getLineHeight(), detail);
+  _display->drawTextCentered(_display->width() / 2, line_y + _display->getLineHeight() * 2, pause);
+  _storage_indicator_ready = true;
 }
 
 void UITask::setCurrScreen(UIScreen* c) {
@@ -2358,6 +2440,7 @@ static void formatDashVal(uint8_t field, char* val, int val_len, uint16_t batt_m
 
 void UITask::enqueueKey(char c) {
   if (c == 0) return;
+  _last_user_input_ms = millis();
   uint8_t next = (_kq_head + 1) % KEY_QUEUE_SIZE;
   if (next == _kq_tail) return;  // full: drop newest rather than clobber unprocessed keys
   _key_queue[_kq_head] = c;
@@ -2618,6 +2701,9 @@ void UITask::pollHallSensor() {
 }
 
 void UITask::loop() {
+#ifdef FIRMWARE_SOLO_BUILD
+  uint32_t phase_started_us = micros();
+#endif
   // Background delivery: resend pending on-device DMs whose ACK timed out, and
   // finalise the ✗ marker — runs regardless of which screen is active.
   ((MessagesScreen*)messages_screen)->tickDmResends();
@@ -2870,11 +2956,21 @@ void UITask::loop() {
   if (buzzer.isPlaying())  buzzer.loop();
 #endif
 
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::UI_EVENTS, micros() - phase_started_us);
+  phase_started_us = micros();
+#endif
+
   if (curr) curr->poll();
 
   // Alarm + countdown run regardless of the current screen / display state, so
   // they're driven here (not via the current screen's poll()).
   tickClockTools();
+
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::UI_POLL, micros() - phase_started_us);
+  phase_started_us = micros();
+#endif
 
   if (_display != NULL && _display->isOn()) {
     if (_locked && (int32_t)(millis() - _lock_wake_until) >= 0) {
@@ -2885,6 +2981,7 @@ void UITask::loop() {
       // Alert overlay on top — without this a ringing alarm on a locked device
       // played its melody against a screen that never said what was ringing.
       if (millis() < _alert_expiry) renderAlertOverlay();
+      renderStorageOverlay();
       _display->endFrame();
       _next_refresh = millis() + Features::LOCKSCREEN_REFRESH_MS;
     } else if (!_locked && millis() >= _next_refresh && curr) {
@@ -2908,6 +3005,7 @@ void UITask::loop() {
       } else {
         _next_refresh = millis() + delay_millis;
       }
+      renderStorageOverlay();
       _display->endFrame();
     }
 #if AUTO_OFF_MILLIS > 0
@@ -2933,6 +3031,11 @@ void UITask::loop() {
     }
 #endif
   }
+
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::UI_RENDER, micros() - phase_started_us);
+  phase_started_us = micros();
+#endif
 
 #ifdef PIN_VIBRATION
   vibration.loop();
@@ -3111,6 +3214,9 @@ void UITask::loop() {
   // Locator proximity beeper — ticks faster the closer to the target. Runs on
   // its own short cadence (the crossing check above is too coarse for this).
   locatorProximityBeeper();
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::UI_BACKGROUND, micros() - phase_started_us);
+#endif
 }
 
 // Evaluate the single geofence against the current GPS fix. Crossing the radius
@@ -3215,7 +3321,7 @@ void UITask::setTargetNow(uint8_t kind, const uint8_t* key, int32_t lat, int32_t
   if (!_node_prefs) return;
   setTarget(kind, key, lat, lon, name);
   the_mesh.savePrefs();
-  showAlert("Target set", 1200);
+  showToast("Target set", 1200);
 }
 
 void UITask::clearTarget() {
@@ -3460,7 +3566,7 @@ void UITask::quickShareMyLocation() {
   int32_t lat, lon;
   if (!currentLocation(lat, lon)) { showAlert("No GPS fix", 1000); return; }
   if (_node_prefs && _node_prefs->loc_share_enabled && sendLocationShare(lat, lon)) {
-    showAlert("Position shared", 900);
+    showToast("Position shared", 900);
     return;
   }
   char text[40];
@@ -3481,7 +3587,7 @@ bool UITask::addWaypoint(int32_t lat, int32_t lon, uint32_t ts, const char* labe
   if (_waypoints.full()) { showAlert("Waypoints full", 1000); return false; }
   if (_waypoints.add(lat, lon, ts, label)) {
     saveWaypoints();
-    showAlert("Waypoint saved", 800);
+    showToast("Waypoint saved", 800);
     return true;
   }
   showAlert("Waypoints full", 1000);
@@ -3493,6 +3599,7 @@ bool UITask::addWaypoint(int32_t lat, int32_t lon, const char* label) {
 }
 
 char UITask::checkDisplayOn(char c) {
+  _last_user_input_ms = millis();
   if (_display != NULL) {
     if (!_display->isOn()) {
       _display->turnOn();

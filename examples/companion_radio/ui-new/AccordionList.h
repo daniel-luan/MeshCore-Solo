@@ -44,12 +44,12 @@ public:
   // collapsed)` and `item(sec, item, y, sel, reserve)` each draw one row
   // (including its own selection bar, as drawList's callers do).
   template <class HeaderFn, class ItemFn>
-  void render(DisplayDriver& d, HeaderFn header, ItemFn item) {
+  void render(DisplayDriver& d, HeaderFn header, ItemFn item, int footer_h = 0) {
     drawList(d, _vis_count, _sel, _scroll, [&](int idx, int y, bool sel, int reserve) {
       const Row& r = _rows[idx];
       if (r.item < 0) header(r.sec, y, sel, reserve, collapsed(r.sec));
       else            item(r.sec, r.item, y, sel, reserve);
-    });
+    }, footer_h);
   }
 
   // Standard navigation. Returns ACTIVATED when Enter lands on an item (the

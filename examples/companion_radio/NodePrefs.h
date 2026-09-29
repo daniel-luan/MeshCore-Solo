@@ -92,12 +92,9 @@ struct NodePrefs {  // persisted to file
   // no end-to-end ACK arrives before the deadline, before the delivery marker
   // shows ✗. 0 = no auto-resend (single attempt). Default 2.
   uint8_t  dm_resend_count;
-  // External LoRa FEM gain (LNA/PA), from upstream companion-v1.17.1 —
-  // board-level only right now (BaseCustomBoard::setLoRaFemLnaEnabled/
-  // PaGainEnabled, both default no-op false), no companion CLI/UI to set
-  // these yet, so — matching upstream's own decision — NOT persisted here:
-  // always reset to the constructor default (MyMesh.cpp) on boot. Not part
-  // of the DataStore save/load tripwire below.
+  // External LoRa FEM gain (LNA/PA). RX gain is exposed in Solo's Radio
+  // settings on Heltec V4 and persisted at the append-only on-disk tail.
+  // Other boards without LNA control ignore it; TX gain remains board-default.
   uint8_t radio_fem_rxgain;
   uint8_t radio_fem_txgain;
   // User-saved radio presets, written by the "Save current..." entry in the
@@ -610,7 +607,7 @@ struct NodePrefs {  // persisted to file
   // repeat_* fields) instead of at the tail, which shifted every field after
   // them by 25 bytes when loading an older file. Never released, but a dev
   // build wrote it, so the number must not be reused for anything else.
-  static const uint32_t SCHEMA_SENTINEL = 0xC0DE002C;
+  static const uint32_t SCHEMA_SENTINEL = 0xC0DE002D;
 
   // Bit-index for each home page. Used by page_order (entries store bit+1) and
   // by home_pages_mask. Single source of truth — both HomeScreen::pageBit/bitToPage

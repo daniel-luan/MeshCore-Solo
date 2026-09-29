@@ -6,7 +6,7 @@
 
 // ESP32 counterpart of helpers/nrf52/DualSerialInterface.h: wraps BLE + USB
 // serial so one build serves both companion transports. BLE takes priority when
-// connected, USB is always ready as a fallback.
+// connected, USB is available as a fallback.
 // enable()/disable() control BLE only — USB is always on.
 // BLE state machine is only pumped when BLE is enabled; USB is not read while
 // BLE is connected.
@@ -35,11 +35,9 @@ public:
   bool isConnected() const override { return true; }
   // True only when a BLE companion app is paired and connected.
   bool isBLEConnected() const override { return _ble_enabled && _ble.isConnected(); }
-#if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE == 0 && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT == 1
-  // Native USB CDC (e.g. Heltec V4): Serial's bool operator reflects whether
-  // the host actually has the port open, same DTR-style signal the nRF52
-  // version reads. Counts as a connected client same as BLE, matching that
-  // version's behaviour.
+#if defined(ARDUINO_USB_MODE) && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT == 1
+  // Both native USB modes expose a connection-aware Serial bool operator:
+  // USBCDC when ARDUINO_USB_MODE=0 and HWCDC (Heltec V4) when it is 1.
   bool isClientConnected() const override { return isBLEConnected() || (bool)Serial; }
 #else
   // BLE only, unlike the nRF52 version, which also counts a USB host holding the
@@ -53,11 +51,22 @@ public:
 #endif
 
   bool isWriteBusy() const override {
-    return (_ble_enabled && _ble.isConnected()) ? _ble.isWriteBusy() : _usb.isWriteBusy();
+    if (isBLEConnected()) return _ble.isWriteBusy();
+#if defined(ARDUINO_USB_MODE) && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT == 1
+    // A native USB port without an open host cannot accept a frame.
+    if (!(bool)Serial) return true;
+#endif
+    return _usb.isWriteBusy();
   }
 
   size_t writeFrame(const uint8_t src[], size_t len) override {
-    return (_ble_enabled && _ble.isConnected()) ? _ble.writeFrame(src, len) : _usb.writeFrame(src, len);
+    if (isBLEConnected()) return _ble.writeFrame(src, len);
+#if defined(ARDUINO_USB_MODE) && defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT == 1
+    // Otherwise streamWriteUntil() waits 300 ms for every frame sent while
+    // the device is being used standalone, freezing the UI for that time.
+    if (!(bool)Serial) return 0;
+#endif
+    return _usb.writeFrame(src, len);
   }
 
   size_t checkRecvFrame(uint8_t dest[]) override {

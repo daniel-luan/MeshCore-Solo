@@ -21,6 +21,10 @@ class SSD1306Display : public DisplayDriver {
   uint8_t _color;
   int _text_sz = 1;
   RefCountedDigitalPin* _peripher_power;
+#ifdef SSD1306_SKIP_UNCHANGED_FRAMES
+  uint32_t _last_frame_hash = 0;
+  bool _force_redraw = true;
+#endif
 
   bool i2c_probe(TwoWire& wire, uint8_t addr);
 #ifdef OLED_MISC_FIXED_FONT

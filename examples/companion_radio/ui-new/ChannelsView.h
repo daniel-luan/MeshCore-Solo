@@ -129,7 +129,7 @@ class ChannelsView {
     uint8_t secret[32];
     hexToSecret(PUBLIC_SECRET_HEX, secret);   // fixed, known-good constant -- can't fail
     if (secretInUse(secret)) { _task->showAlert("Already added", 1200); _mode = OFF; return; }
-    if (saveChannel("Public", secret)) _task->showAlert("Channel added", 1000);
+    if (saveChannel("Public", secret)) _task->showToast("Channel added", 1000);
     else                               _task->showAlert("Save failed", 1200);
     _mode = OFF;
   }

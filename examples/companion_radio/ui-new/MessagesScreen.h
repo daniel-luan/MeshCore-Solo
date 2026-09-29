@@ -564,7 +564,7 @@ class MessagesScreen : public UIScreen {
       _history.setChUnread(_sel_channel_idx, 0);
       _unread_at_entry = 0;
       _viewing_max_seen = 0;
-      _task->showAlert("Sent", 600);
+      _task->showToast("Sent", 600);
     } else if (ok) {
       NodePrefs* np = _task->getNodePrefs();
       uint8_t resends = np ? np->dm_resend_count : 0;
@@ -573,7 +573,7 @@ class MessagesScreen : public UIScreen {
       _dm_hist_sel = 0;
       _dm_hist_scroll = 0;
       _phase = DM_HIST;
-      _task->showAlert("Sent", 600);
+      _task->showToast("Sent", 600);
     } else {
       _task->showAlert("Send failed", 1500);
       _task->gotoHomeScreen();
@@ -1203,7 +1203,7 @@ public:
       the_mesh.savePrefs();
     }
     _pick_target = false;
-    _task->showAlert("Share target set", 1200);
+    _task->showToast("Share target set", 1200);
     _task->gotoLiveShareScreen();
   }
 
@@ -1246,7 +1246,7 @@ public:
       the_mesh.savePrefs();
     }
     _pick_bot_channel = false;
-    _task->showAlert("Bot channel set", 1200);
+    _task->showToast("Bot channel set", 1200);
     _task->gotoBotScreen();
   }
 
@@ -1272,7 +1272,7 @@ public:
     }
     _pick_bot_room = false;
     _room_mode = false;
-    _task->showAlert("Bot room set", 1200);
+    _task->showToast("Bot room set", 1200);
     _task->gotoBotScreen();
   }
 
@@ -1290,7 +1290,7 @@ public:
       the_mesh.savePrefs();
     }
     _pick_target = false;
-    _task->showAlert("Share target set", 1200);
+    _task->showToast("Share target set", 1200);
     _task->gotoLiveShareScreen();
   }
 
@@ -2021,7 +2021,7 @@ public:
                 // Logout: only reachable when isRoomLoggedIn() added this item.
                 the_mesh.logoutRoom(_sel_contact.id.pub_key);
                 forgetRoomLoggedIn(_sel_contact.id.pub_key);
-                _task->showAlert("Logged out", 1000);
+                _task->showToast("Logged out", 1000);
               }
               // Fav is a value row -- Enter never selects it (see cycleRoomCtxValue).
             }
@@ -2193,7 +2193,7 @@ public:
             ChannelDetails ch;
             memset(&ch, 0, sizeof(ch));
             the_mesh.setChannelLocal(_ctx_ch_idx, ch);
-            _task->showAlert("Channel deleted", 1000);
+            _task->showToast("Channel deleted", 1000);
           }
           if (res != PopupMenu::NONE) {
             _ch_delete_confirm_active = false;

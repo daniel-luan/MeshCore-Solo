@@ -1,5 +1,6 @@
 #include "ArduinoSerialInterface.h"
 #include "StreamUtils.h"
+#include "DeviceTiming.h"
 
 // Worst-case time we'll let writeFrame() block waiting for the host to drain
 // the link, before giving up on the rest of the frame. See StreamUtils.h.
@@ -27,6 +28,9 @@ bool ArduinoSerialInterface::isWriteBusy() const {
 }
 
 size_t ArduinoSerialInterface::writeFrame(const uint8_t src[], size_t len) {
+#ifdef FIRMWARE_SOLO_BUILD
+  ScopedDeviceTiming timing(DeviceTiming::USB_WRITE);
+#endif
   if (len > MAX_FRAME_SIZE) {
     // frame is too big!
     return 0;

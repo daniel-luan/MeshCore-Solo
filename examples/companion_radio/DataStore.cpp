@@ -1,7 +1,12 @@
 #include <Arduino.h>
 #include "DataStore.h"
 #include "Features.h"   // FEAT_JOYSTICK_ROTATION_SETTING (else `#if !FEAT_…` is always true)
+#include <helpers/DeviceTiming.h>
 #include <target.h>     // radio_driver — repeater-profile freq bounds (getFreqBounds)
+#if defined(ESP32) && defined(FIRMWARE_SOLO_BUILD)
+  #include <freertos/FreeRTOS.h>
+  #include <freertos/task.h>
+#endif
 
 #if defined(EXTRAFS) || defined(QSPIFLASH)
   #define MAX_BLOBRECS 100
@@ -58,6 +63,112 @@ static bool commitTempFile(FILESYSTEM* fs, const char* tmp, const char* final_pa
   return fs->rename(tmp, final_path);
 #endif
 }
+
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+// A/B slots let the previous complete generation survive power loss while the
+// inactive slot is being rewritten. Both slots are checked before loading.
+struct SnapshotHeader {
+  uint32_t magic;
+  uint32_t generation;
+  uint32_t length;
+  uint32_t crc;
+};
+static_assert(sizeof(SnapshotHeader) == 16, "snapshot header layout changed");
+static constexpr uint32_t PREFS_MAGIC = 0x34534650;    // PFS4
+static constexpr uint32_t CONTACTS_MAGIC = 0x34544E43; // CNT4
+static constexpr const char* PREFS_A = "/prefs_a";
+static constexpr const char* PREFS_B = "/prefs_b";
+static constexpr const char* CONTACTS_A = "/contacts_a";
+static constexpr const char* CONTACTS_B = "/contacts_b";
+
+static uint32_t snapshotCrc(uint32_t crc, const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ ((crc & 1) ? 0xEDB88320UL : 0);
+  }
+  return crc;
+}
+
+static bool validSnapshot(FILESYSTEM* fs, const char* path, uint32_t magic,
+                          uint32_t max_length, uint32_t record_size, SnapshotHeader& out) {
+  File f = fs->open(path, "r", false);
+  if (!f) return false;
+  SnapshotHeader h;
+  bool ok = f.read((uint8_t*)&h, sizeof(h)) == sizeof(h)
+    && h.magic == magic && h.length <= max_length
+    && (magic != PREFS_MAGIC || h.length >= sizeof(uint32_t))
+    && (!record_size || h.length % record_size == 0)
+    && f.size() == sizeof(h) + h.length;
+  uint8_t buf[512];
+  uint32_t crc = 0xFFFFFFFFUL;
+  uint32_t left = ok ? h.length : 0;
+  while (left) {
+    size_t n = left > sizeof(buf) ? sizeof(buf) : left;
+    if (f.read(buf, n) != n) { ok = false; break; }
+    crc = snapshotCrc(crc, buf, n);
+    left -= n;
+  }
+  if (ok && magic == PREFS_MAGIC) {
+    uint32_t sentinel = 0;
+    ok = f.seek(sizeof(h) + h.length - sizeof(sentinel))
+      && f.read((uint8_t*)&sentinel, sizeof(sentinel)) == sizeof(sentinel)
+      && sentinel == NodePrefs::SCHEMA_SENTINEL;
+  }
+  f.close();
+  if (!ok || left || ~crc != h.crc) return false;
+  out = h;
+  return true;
+}
+
+static const char* newestSnapshot(FILESYSTEM* fs, const char* a, const char* b,
+                                  uint32_t magic, uint32_t max_length, uint32_t record_size,
+                                  SnapshotHeader& out) {
+  SnapshotHeader ha = {}, hb = {};
+  bool va = validSnapshot(fs, a, magic, max_length, record_size, ha);
+  bool vb = validSnapshot(fs, b, magic, max_length, record_size, hb);
+  if (!va && !vb) return nullptr;
+  if (va && (!vb || (int32_t)(ha.generation - hb.generation) >= 0)) { out = ha; return a; }
+  out = hb;
+  return b;
+}
+
+class SnapshotWriter {
+  File& _file;
+  uint8_t _buf[512];
+  size_t _used = 0;
+  bool _ok = true;
+  uint32_t _crc = 0xFFFFFFFFUL;
+  uint32_t _length = 0;
+  bool flush() {
+    if (!_ok) return false;
+    if (_used && _file.write(_buf, _used) != _used) _ok = false;
+    _used = 0;
+    return _ok;
+  }
+public:
+  explicit SnapshotWriter(File& file) : _file(file) {}
+  size_t write(const uint8_t* data, size_t len) {
+    if (!_ok || len > UINT32_MAX - _length) return 0;
+    size_t pos = 0;
+    while (pos < len) {
+      size_t n = sizeof(_buf) - _used;
+      if (n > len - pos) n = len - pos;
+      memcpy(_buf + _used, data + pos, n);
+      _used += n;
+      pos += n;
+      if (_used == sizeof(_buf) && !flush()) return 0;
+    }
+    _crc = snapshotCrc(_crc, data, len);
+    _length += len;
+    return len;
+  }
+  bool finish(uint32_t magic, uint32_t generation) {
+    if (!flush()) return false;
+    SnapshotHeader h = { magic, generation, _length, ~_crc };
+    return _file.seek(0) && _file.write((const uint8_t*)&h, sizeof(h)) == sizeof(h);
+  }
+};
+#endif
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
   static uint32_t _ContactsChannelsTotalBlocks = 0;
@@ -217,16 +328,26 @@ bool DataStore::saveMainIdentity(const mesh::LocalIdentity &identity) {
 }
 
 void DataStore::loadPrefs(NodePrefs& prefs, double& node_lat, double& node_lon) {
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  SnapshotHeader h = {};
+  const char* path = newestSnapshot(_fs, PREFS_A, PREFS_B, PREFS_MAGIC, 8192, 0, h);
+  if (path) {
+    _prefs_snapshot_slot = path == PREFS_A ? 0 : 1;
+    _prefs_generation = h.generation;
+    loadPrefsInt(path, prefs, node_lat, node_lon, sizeof(SnapshotHeader));
+    return;
+  }
+#endif
   if (_fs->exists("/new_prefs")) {
     loadPrefsInt("/new_prefs", prefs, node_lat, node_lon); // new filename
   } else if (_fs->exists("/node_prefs")) {
     loadPrefsInt("/node_prefs", prefs, node_lat, node_lon);
-    savePrefs(prefs, node_lat, node_lon);                // save to new filename
-    _fs->remove("/node_prefs"); // remove old
+    if (savePrefs(prefs, node_lat, node_lon))
+      _fs->remove("/node_prefs"); // keep the old copy if migration failed
   }
 }
 
-void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& node_lat, double& node_lon) {
+void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& node_lat, double& node_lon, size_t offset) {
   // Set hardware defaults before reading — if the file is older and lacks these fields,
   // the compile-time values apply rather than the zero from memset in MyMesh::begin().
 #ifdef DISPLAY_ROTATION
@@ -238,6 +359,7 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& no
   _prefs.repeat_min_snr = NodePrefs::REPEAT_SNR_DISABLED;
   File file = openRead(_fs, filename);
   if (!file) return;
+  if (offset && !file.seek(offset)) { file.close(); return; }
 
   uint8_t pad[8];
 
@@ -613,6 +735,11 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& no
   rd(&_prefs.contact_expiry_idx, sizeof(_prefs.contact_expiry_idx));
   if (_prefs.contact_expiry_idx >= NodePrefs::CONTACT_EXPIRY_COUNT) _prefs.contact_expiry_idx = 0;
 
+  // External FEM LNA. Old saves end here with their 0x2C sentinel, so a
+  // missing value (or that sentinel byte) must keep the previous ON default.
+  rd(&_prefs.radio_fem_rxgain, sizeof(_prefs.radio_fem_rxgain));
+  if (_prefs.radio_fem_rxgain > 1) _prefs.radio_fem_rxgain = 1;
+
   // Schema sentinel: bumped on layout changes. Mismatch means an older file
   // (or a different schema); rd() and the clamps above already keep every
   // field within its valid range regardless, so we just log it here —
@@ -640,11 +767,30 @@ void DataStore::loadPrefsInt(const char *filename, NodePrefs& _prefs, double& no
   file.close();
 }
 
-void DataStore::savePrefs(const NodePrefs& _prefs, double node_lat, double node_lon) {
-  // Atomic temp-then-rename (see commitTempFile) so an interrupted save can't
-  // wipe settings; loadPrefs() still validates the tail sentinel on read.
+bool DataStore::savePrefs(const NodePrefs& _prefs, double node_lat, double node_lon) {
+#ifdef FIRMWARE_SOLO_BUILD
+  ScopedDeviceTiming timing(DeviceTiming::PREFS_WRITE);
+#endif
+  // The V4 writes the inactive checked snapshot. Other targets retain their
+  // existing temp-file format and load path.
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  const char* target = _prefs_snapshot_slot == 0 ? PREFS_B : PREFS_A;
+  uint32_t next_generation = _prefs_generation + 1;
+  File raw_file = ::openWrite(_fs, target);
+  if (!raw_file) return false;
+  SnapshotHeader invalid = {};
+  if (raw_file.write((const uint8_t*)&invalid, sizeof(invalid)) != sizeof(invalid)) {
+    raw_file.close(); _fs->remove(target); return false;
+  }
+  SnapshotWriter file(raw_file);
+#else
   File file = ::openWrite(_fs, "/new_prefs.tmp");
+#endif
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  if (raw_file) {
+#else
   if (file) {
+#endif
     uint8_t pad[8];
     memset(pad, 0, sizeof(pad));
 
@@ -805,6 +951,7 @@ void DataStore::savePrefs(const NodePrefs& _prefs, double node_lat, double node_
     file.write((uint8_t *)&_prefs.repeat_extra_scope_mask, sizeof(_prefs.repeat_extra_scope_mask));
     file.write((uint8_t *)_prefs.ch_scope_idx, sizeof(_prefs.ch_scope_idx));
     file.write((uint8_t *)&_prefs.contact_expiry_idx, sizeof(_prefs.contact_expiry_idx));
+    file.write((uint8_t *)&_prefs.radio_fem_rxgain, sizeof(_prefs.radio_fem_rxgain));
 
     // Tail sentinel — must be last. See NodePrefs::SCHEMA_SENTINEL. Its write is
     // the one we check: once the flash fills, writes return 0, so a good
@@ -812,13 +959,25 @@ void DataStore::savePrefs(const NodePrefs& _prefs, double node_lat, double node_
     uint32_t sentinel = NodePrefs::SCHEMA_SENTINEL;
     bool ok = (file.write((uint8_t *)&sentinel, sizeof(sentinel)) == sizeof(sentinel));
 
-    file.close();
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+    if (ok) ok = file.finish(PREFS_MAGIC, next_generation);
+    raw_file.close();
+    SnapshotHeader check = {};
+    if (ok) ok = validSnapshot(_fs, target, PREFS_MAGIC, 8192, 0, check);
     if (ok) {
-      commitTempFile(_fs, "/new_prefs.tmp", "/new_prefs");
+      _prefs_snapshot_slot = target == PREFS_A ? 0 : 1;
+      _prefs_generation = next_generation;
     } else {
-      _fs->remove("/new_prefs.tmp");   // keep the previous good /new_prefs
+      _fs->remove(target);
     }
+#else
+    file.close();
+    if (ok) ok = commitTempFile(_fs, "/new_prefs.tmp", "/new_prefs");
+    else _fs->remove("/new_prefs.tmp");
+#endif
+    return ok;
   }
+  return false;
 }
 
 void DataStore::saveRTCTime() {
@@ -851,9 +1010,26 @@ void DataStore::restoreRTCTime() {
   }
 }
 
+static const size_t CONTACT_RECORD_SIZE = 32 + 32 + 1 + 1 + 1 + 4 + 1 + 4 + 64 + 4 + 4 + 4;
+
 void DataStore::loadContacts(DataStoreHost* host) {
-File file = openRead(_getContactsChannelsFS(), "/contacts3");
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  const char* path = "/contacts3";
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  SnapshotHeader h = {};
+  const char* current = newestSnapshot(fs, CONTACTS_A, CONTACTS_B, CONTACTS_MAGIC,
+                                        CONTACT_RECORD_SIZE * MAX_CONTACTS, CONTACT_RECORD_SIZE, h);
+  if (current) {
+    path = current;
+    _contacts_snapshot_slot = current == CONTACTS_A ? 0 : 1;
+    _contacts_generation = h.generation;
+  }
+#endif
+  File file = openRead(fs, path);
     if (file) {
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+      if (path != "/contacts3" && !file.seek(sizeof(SnapshotHeader))) { file.close(); return; }
+#endif
       bool full = false;
       while (!full) {
         ContactInfo c;
@@ -882,50 +1058,294 @@ File file = openRead(_getContactsChannelsFS(), "/contacts3");
     }
 }
 
-void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
+static void encodeContactRecord(uint8_t* dest, const ContactInfo& c) {
+  size_t pos = 0;
+  const uint8_t unused = 0;
+  auto append = [&](const void* src, size_t len) {
+    memcpy(dest + pos, src, len);
+    pos += len;
+  };
+  append(c.id.pub_key, 32);
+  append(c.name, 32);
+  append(&c.type, 1);
+  append(&c.flags, 1);
+  append(&unused, 1);
+  append(&c.sync_since, 4);
+  append(&c.out_path_len, 1);
+  append(&c.last_advert_timestamp, 4);
+  append(c.out_path, 64);
+  append(&c.lastmod, 4);
+  append(&c.gps_lat, 4);
+  append(&c.gps_lon, 4);
+}
+
+#if defined(ESP32) && defined(FIRMWARE_SOLO_BUILD)
+bool DataStore::startContactSaveDeferred(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
+  if (isContactSaveBusy()) return false;
+
+  // Capture a consistent snapshot before allowing the mesh to process more
+  // packets. Later advert/contact changes will arm another lazy save.
+  uint32_t idx = 0;
+  size_t count = 0;
+  ContactInfo c;
+  while (host->getContactForSave(idx++, c)) {
+    if (!filter || filter(c)) count++;
+  }
+  if (count > SIZE_MAX / CONTACT_RECORD_SIZE) return false;
+  size_t len = count * CONTACT_RECORD_SIZE;
+  uint8_t* snapshot = (uint8_t*)malloc(len ? len : 1);
+  if (!snapshot) return false;
+
+  idx = 0;
+  size_t pos = 0;
+  while (host->getContactForSave(idx++, c)) {
+    if (filter && !filter(c)) continue;
+    if (pos + CONTACT_RECORD_SIZE > len) { free(snapshot); return false; }
+    encodeContactRecord(snapshot + pos, c);
+    pos += CONTACT_RECORD_SIZE;
+  }
+
+  _contact_snapshot = snapshot;
+  _contact_snapshot_len = pos;
+  _contact_snapshot_pos = 0;
+  _contact_save_io_us = 0;
+  _contact_save_data_us = 0;
+  _contact_save_started_ms = millis();
+  _contact_next_step_ms = 0;
+#if defined(SOLO_SAFE_STORAGE)
+  _contact_save_target = _contacts_snapshot_slot == 0 ? CONTACTS_B : CONTACTS_A;
+  _contact_save_generation = _contacts_generation + 1;
+  _contact_save_crc = 0xFFFFFFFFUL;
+#endif
+  _contact_save_phase = 1;  // open temp file on the next loop
+  return true;
+}
+
+void DataStore::stepContactSave(bool force) {
+  if (_contact_save_phase == 0) return;
+  if (!force && _contact_next_step_ms && (int32_t)(millis() - _contact_next_step_ms) < 0) return;
   FILESYSTEM* fs = _getContactsChannelsFS();
-  // Write to a temp file, then atomically rename it over /contacts3 only once
-  // every record has written cleanly. The old code truncated /contacts3 up
-  // front and wrote in place, so a crash, reset or full flash mid-save wiped
-  // the entire contact list. Now an interrupted save leaves the previous good
-  // file untouched.
+  uint32_t started_us = micros();
+
+  if (_contact_save_phase == 1) {
+#if defined(SOLO_SAFE_STORAGE)
+    _contact_save_file = ::openWrite(fs, _contact_save_target);
+    SnapshotHeader invalid = {};
+    bool header_ok = _contact_save_file &&
+      _contact_save_file.write((const uint8_t*)&invalid, sizeof(invalid)) == sizeof(invalid);
+    if (!header_ok && _contact_save_file) {
+      _contact_save_file.close();
+    }
+#else
+    _contact_save_file = ::openWrite(fs, "/contacts3.tmp");
+#endif
+    uint32_t elapsed_us = micros() - started_us;
+    device_timing.record(DeviceTiming::CONTACTS_OPEN, elapsed_us);
+    _contact_save_io_us += elapsed_us;
+    if (
+#if defined(SOLO_SAFE_STORAGE)
+        !header_ok
+#else
+        !_contact_save_file
+#endif
+    ) {
+      _contact_save_failed = true;
+#if defined(SOLO_SAFE_STORAGE)
+      fs->remove(_contact_save_target);
+#endif
+      free(_contact_snapshot);
+      _contact_snapshot = nullptr;
+      _contact_save_phase = 0;
+      return;
+    }
+    _contact_save_phase = _contact_snapshot_len ? 2 : 3;
+    _contact_next_step_ms = millis() + 50;
+  } else if (_contact_save_phase == 2) {
+    // Bound each foreground write to a single flash page. The UI runs again
+    // before the next chunk instead of waiting for the whole contact file.
+    size_t n = _contact_snapshot_len - _contact_snapshot_pos;
+    if (n > 256) n = 256;
+    size_t written = _contact_save_file.write(_contact_snapshot + _contact_snapshot_pos, n);
+    uint32_t elapsed_us = micros() - started_us;
+    device_timing.record(DeviceTiming::CONTACTS_CHUNK, elapsed_us);
+    _contact_save_io_us += elapsed_us;
+    _contact_save_data_us += elapsed_us;
+    if (written != n) {
+      _contact_save_failed = true;
+      _contact_save_phase = 3;
+    } else {
+#if defined(SOLO_SAFE_STORAGE)
+      _contact_save_crc = snapshotCrc(_contact_save_crc, _contact_snapshot + _contact_snapshot_pos, n);
+#endif
+      _contact_snapshot_pos += n;
+      if (_contact_snapshot_pos == _contact_snapshot_len) _contact_save_phase = 3;
+    }
+    _contact_next_step_ms = millis() + 50;
+  } else if (_contact_save_phase == 3) {
+#if defined(SOLO_SAFE_STORAGE)
+    if (!_contact_save_failed) {
+      SnapshotHeader h = { CONTACTS_MAGIC, _contact_save_generation,
+                           (uint32_t)_contact_snapshot_len, ~_contact_save_crc };
+      if (!_contact_save_file.seek(0) ||
+          _contact_save_file.write((const uint8_t*)&h, sizeof(h)) != sizeof(h)) {
+        _contact_save_failed = true;
+      }
+    }
+#endif
+    _contact_save_file.close();
+    uint32_t elapsed_us = micros() - started_us;
+    device_timing.record(DeviceTiming::CONTACTS_CLOSE, elapsed_us);
+    _contact_save_io_us += elapsed_us;
+    _contact_save_phase = 4;
+    _contact_next_step_ms = millis() + 50;
+  } else {
+#if defined(SOLO_SAFE_STORAGE)
+    SnapshotHeader check = {};
+    if (!_contact_save_failed) {
+      _contact_save_failed = !validSnapshot(fs, _contact_save_target, CONTACTS_MAGIC,
+                                             CONTACT_RECORD_SIZE * MAX_CONTACTS,
+                                             CONTACT_RECORD_SIZE, check);
+    }
+    if (_contact_save_failed) fs->remove(_contact_save_target);
+    else {
+      _contacts_snapshot_slot = _contact_save_target == CONTACTS_A ? 0 : 1;
+      _contacts_generation = _contact_save_generation;
+    }
+#else
+    if (_contact_save_failed) {
+      fs->remove("/contacts3.tmp");
+    } else if (!commitTempFile(fs, "/contacts3.tmp", "/contacts3")) {
+      _contact_save_failed = true;
+    }
+#endif
+    uint32_t elapsed_us = micros() - started_us;
+    device_timing.record(DeviceTiming::CONTACTS_REPLACE, elapsed_us);
+    _contact_save_io_us += elapsed_us;
+    device_timing.record(DeviceTiming::CONTACTS_DATA, _contact_save_data_us);
+    device_timing.record(DeviceTiming::CONTACTS_WRITE, _contact_save_io_us);
+    free(_contact_snapshot);
+    _contact_snapshot = nullptr;
+    _contact_save_phase = 0;
+  }
+}
+
+void DataStore::finishContactSave() {
+  while (isContactSaveBusy()) stepContactSave(true);
+}
+#endif
+
+void DataStore::saveContacts(DataStoreHost* host, bool (*filter)(const ContactInfo& c)) {
+#if defined(ESP32) && defined(FIRMWARE_SOLO_BUILD)
+  finishContactSave();
+#endif
+#ifdef FIRMWARE_SOLO_BUILD
+  ScopedDeviceTiming timing(DeviceTiming::CONTACTS_WRITE);
+  uint32_t phase_started_us = micros();
+#endif
+  FILESYSTEM* fs = _getContactsChannelsFS();
+  // On V4, rewrite only the inactive checked slot. Other targets retain the
+  // temp-file path. An interrupted save leaves the previous good slot intact.
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  const char* target = _contacts_snapshot_slot == 0 ? CONTACTS_B : CONTACTS_A;
+  uint32_t generation = _contacts_generation + 1;
+  File file = ::openWrite(fs, target);
+  SnapshotHeader invalid = {};
+  bool header_ok = file && file.write((const uint8_t*)&invalid, sizeof(invalid)) == sizeof(invalid);
+#else
   File file = ::openWrite(fs, "/contacts3.tmp");
-  if (!file) return;
+#endif
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::CONTACTS_OPEN, micros() - phase_started_us);
+  phase_started_us = micros();
+#endif
+  if (!file
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+      || !header_ok
+#endif
+  ) {
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+    if (file) file.close();
+    fs->remove(target);
+    _contact_save_failed = true;
+#endif
+    return;
+  }
 
   bool ok = true;
   uint32_t idx = 0;
   ContactInfo c;
-  uint8_t unused = 0;
+  // SPIFFS pays for every File.write() call. A contact used to make twelve
+  // small writes; batch eight complete records into one write while preserving
+  // the exact /contacts3 byte layout read by loadContacts().
+  uint8_t batch[CONTACT_RECORD_SIZE * 8];
+  size_t batch_len = 0;
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  uint32_t crc = 0xFFFFFFFFUL;
+  uint32_t payload_len = 0;
+#endif
 
   while (host->getContactForSave(idx, c)) {
     if (filter && !filter(c)) {
       idx++;  // advance to next contact
       continue;
     }
-    bool success = (file.write(c.id.pub_key, 32) == 32);
-    success = success && (file.write((uint8_t *)&c.name, 32) == 32);
-    success = success && (file.write(&c.type, 1) == 1);
-    success = success && (file.write(&c.flags, 1) == 1);
-    success = success && (file.write(&unused, 1) == 1);
-    success = success && (file.write((uint8_t *)&c.sync_since, 4) == 4);
-    success = success && (file.write((uint8_t *)&c.out_path_len, 1) == 1);
-    success = success && (file.write((uint8_t *)&c.last_advert_timestamp, 4) == 4);
-    success = success && (file.write(c.out_path, 64) == 64);
-    success = success && (file.write((uint8_t *)&c.lastmod, 4) == 4);
-    success = success && (file.write((uint8_t *)&c.gps_lat, 4) == 4);
-    success = success && (file.write((uint8_t *)&c.gps_lon, 4) == 4);
+    encodeContactRecord(batch + batch_len, c);
+    batch_len += CONTACT_RECORD_SIZE;
 
-    if (!success) { ok = false; break; } // write failed (e.g. flash full)
+    if (batch_len == sizeof(batch)) {
+      if (file.write(batch, batch_len) != batch_len) { ok = false; break; }
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+      crc = snapshotCrc(crc, batch, batch_len);
+      payload_len += batch_len;
+#endif
+      batch_len = 0;
+    }
 
     idx++;  // advance to next contact
   }
-  file.close();
-
-  if (ok) {
-    commitTempFile(fs, "/contacts3.tmp", "/contacts3");
-  } else {
-    fs->remove("/contacts3.tmp");   // keep the previous good /contacts3
+  if (ok && batch_len) {
+    if (file.write(batch, batch_len) != batch_len) ok = false;
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+    else {
+      crc = snapshotCrc(crc, batch, batch_len);
+      payload_len += batch_len;
+    }
+#endif
   }
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  if (ok) {
+    SnapshotHeader h = { CONTACTS_MAGIC, generation, payload_len, ~crc };
+    ok = file.seek(0) && file.write((const uint8_t*)&h, sizeof(h)) == sizeof(h);
+  }
+#endif
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::CONTACTS_DATA, micros() - phase_started_us);
+  phase_started_us = micros();
+#endif
+  file.close();
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::CONTACTS_CLOSE, micros() - phase_started_us);
+  phase_started_us = micros();
+#endif
+
+#if defined(SOLO_SAFE_STORAGE) && defined(ESP32)
+  SnapshotHeader check = {};
+  if (ok) ok = validSnapshot(fs, target, CONTACTS_MAGIC,
+                              CONTACT_RECORD_SIZE * MAX_CONTACTS, CONTACT_RECORD_SIZE, check);
+  if (ok) {
+    _contacts_snapshot_slot = target == CONTACTS_A ? 0 : 1;
+    _contacts_generation = generation;
+  } else {
+    fs->remove(target);
+    _contact_save_failed = true;
+  }
+#else
+  if (ok) ok = commitTempFile(fs, "/contacts3.tmp", "/contacts3");
+  if (!ok) fs->remove("/contacts3.tmp");
+#endif
+#ifdef FIRMWARE_SOLO_BUILD
+  device_timing.record(DeviceTiming::CONTACTS_REPLACE, micros() - phase_started_us);
+#endif
 }
 
 bool DataStore::loadChannels(DataStoreHost* host) {
@@ -1264,6 +1684,9 @@ uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_b
 }
 
 bool DataStore::putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], uint8_t len) {
+#ifdef FIRMWARE_SOLO_BUILD
+  ScopedDeviceTiming timing(DeviceTiming::ADVERT_WRITE);
+#endif
   if (len < PUB_KEY_SIZE+4+SIGNATURE_SIZE || len > MAX_ADVERT_PKT_LEN) return false;
   checkAdvBlobFile();
   File file = _getContactsChannelsFS()->open("/adv_blobs", FILE_O_WRITE);
@@ -1312,6 +1735,16 @@ inline void makeBlobPath(const uint8_t key[], int key_len, char* path, size_t pa
 }
 
 uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) {
+#if defined(DEFER_ADVERT_FLASH) && defined(ESP32)
+  if (key_len >= 8) {
+    for (const auto& pending : _pending_adverts) {
+      if (pending.dirty && memcmp(pending.key, key, 8) == 0) {
+        memcpy(dest_buf, pending.data, pending.len);
+        return pending.len;
+      }
+    }
+  }
+#endif
   char path[64];
   makeBlobPath(key, key_len, path, sizeof(path));
 
@@ -1326,22 +1759,88 @@ uint8_t DataStore::getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_b
   return 0; // not found
 }
 
-bool DataStore::putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], uint8_t len) {
+static bool writeBlobNow(FILESYSTEM* fs, const uint8_t key[], int key_len, const uint8_t src_buf[], uint8_t len) {
   char path[64];
+#ifdef FIRMWARE_SOLO_BUILD
+  ScopedDeviceTiming timing(DeviceTiming::ADVERT_WRITE);
+#endif
   makeBlobPath(key, key_len, path, sizeof(path));
 
-  File f = ::openWrite(_fs, path);
+  File f = ::openWrite(fs, path);
   if (f) {
     int n = f.write(src_buf, len);
     f.close();
     if (n == len) return true; // success!
 
-    _fs->remove(path); // blob was only partially written!
+    fs->remove(path); // blob was only partially written!
   }
   return false; // error
 }
 
+bool DataStore::putBlobByKey(const uint8_t key[], int key_len, const uint8_t src_buf[], uint8_t len) {
+#if defined(DEFER_ADVERT_FLASH) && defined(ESP32)
+  if (key_len >= 8 && len > 0) {
+    PendingAdvert* slot = nullptr;
+    for (auto& pending : _pending_adverts) {
+      if (pending.dirty && memcmp(pending.key, key, 8) == 0) { slot = &pending; break; }
+    }
+    if (!slot) {
+      for (auto& pending : _pending_adverts) {
+        if (!pending.dirty) { slot = &pending; break; }
+      }
+    }
+    if (slot) {
+      memcpy(slot->key, key, 8);
+      memcpy(slot->data, src_buf, len);
+      slot->len = len;
+      slot->dirty = true;
+      return true;
+    }
+  }
+  // The bounded queue is full: preserve the old persistence behaviour.
+#endif
+  return writeBlobNow(_fs, key, key_len, src_buf, len);
+}
+
+#if defined(DEFER_ADVERT_FLASH) && defined(ESP32)
+bool DataStore::hasPendingAdvertWrites() const {
+  for (const auto& pending : _pending_adverts) {
+    if (pending.dirty) return true;
+  }
+  return false;
+}
+
+void DataStore::stepPendingAdvertWrite() {
+  if (_next_advert_write_ms && (int32_t)(millis() - _next_advert_write_ms) < 0) return;
+  for (uint8_t n = 0; n < MAX_PENDING_ADVERTS; n++) {
+    uint8_t idx = (_next_advert_slot + n) % MAX_PENDING_ADVERTS;
+    PendingAdvert& pending = _pending_adverts[idx];
+    if (!pending.dirty) continue;
+    bool saved = writeBlobNow(_fs, pending.key, 8, pending.data, pending.len);
+    if (saved) pending.dirty = false;
+    _next_advert_slot = (idx + 1) % MAX_PENDING_ADVERTS;
+    _next_advert_write_ms = millis() + (saved ? 250 : 5000);
+    return;
+  }
+}
+
+void DataStore::finishPendingAdvertWrites() {
+  for (auto& pending : _pending_adverts) {
+    if (pending.dirty && writeBlobNow(_fs, pending.key, 8, pending.data, pending.len)) {
+      pending.dirty = false;
+    }
+  }
+}
+#endif
+
 bool DataStore::deleteBlobByKey(const uint8_t key[], int key_len) {
+#if defined(DEFER_ADVERT_FLASH) && defined(ESP32)
+  if (key_len >= 8) {
+    for (auto& pending : _pending_adverts) {
+      if (pending.dirty && memcmp(pending.key, key, 8) == 0) pending.dirty = false;
+    }
+  }
+#endif
   char path[64];
   makeBlobPath(key, key_len, path, sizeof(path));
 

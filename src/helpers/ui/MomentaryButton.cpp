@@ -102,10 +102,18 @@ void MomentaryButton::begin() {
         // polling path: that button still works, it just won't capture edges
         // that land during a blocking display refresh. Retrying another index is
         // pointless — the channel pool, not the trampoline slot, is what ran out.
+        // Arduino-ESP32's attachInterrupt() returns void; nRF52 returns a
+        // channel number (0 when its finite GPIOTE pool is exhausted).
+#if defined(ESP32_PLATFORM)
+        _isr_table[i] = this;
+        _isr_slot = i;
+        attachInterrupt(digitalPinToInterrupt(_pin), ISR_TRAMPOLINES[i], CHANGE);
+#else
         if (attachInterrupt(digitalPinToInterrupt(_pin), ISR_TRAMPOLINES[i], CHANGE) != 0) {
           _isr_table[i] = this;
           _isr_slot = i;
         }
+#endif
         break;
       }
     }

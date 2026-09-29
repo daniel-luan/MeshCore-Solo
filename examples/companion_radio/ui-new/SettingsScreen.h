@@ -63,6 +63,9 @@ class SettingsScreen : public UIScreen {
     CUSTOM_FREQ, CUSTOM_SF, CUSTOM_BW, CUSTOM_CR,
     POWER_SAVE,
     TX_APC,
+#if defined(HELTEC_LORA_V4)
+    FEM_LNA,
+#endif
     SCOPE_NAME,
     // System section
     SECTION_SYSTEM,
@@ -568,6 +571,12 @@ class SettingsScreen : public UIScreen {
       // Suppressed (and locked) while repeating — a repeater holds full TX power.
       if (p && p->client_repeat) display.print("--");
       else display.print((p && p->tx_apc) ? "ON" : "OFF");
+#if defined(HELTEC_LORA_V4)
+    } else if (item == FEM_LNA) {
+      display.print("Ext LNA");
+      display.setCursor(valCol(display), y);
+      display.print(board.canControlLoRaFemLna() ? (board.isLoRaFemLnaEnabled() ? "ON" : "OFF") : "--");
+#endif
     } else if (item == SCOPE_NAME) {
       display.print("Scope");
       int vx = valCol(display);
@@ -814,7 +823,15 @@ public:
         _reserve = reserve;
         int r = renderItem(display, _sec_items[sec][item], y, sel);
         if (r > 0) mq_delay = r;
-      });
+      }, display.getLineHeight() + 1);
+
+    display.setColor(DisplayDriver::DARK);
+    display.fillRect(0, display.height() - display.getLineHeight() - 1,
+                     display.width(), display.getLineHeight() + 1);
+    display.setColor(DisplayDriver::LIGHT);
+    display.drawTextCentered(display.width() / 2,
+                             display.height() - display.getLineHeight() - 1,
+                             "OK Open  Back Exit");
 
     if (_picker.menu.active) _picker.menu.render(display);
     if (_prune_confirm.active) _prune_confirm.render(display);
@@ -937,7 +954,7 @@ public:
       if (res == KeyboardWidget::DONE) {
         if (p && _picker.save(p, _kb->buf, radioTarget(p))) {
           _dirty = true;
-          _task->showAlert("Preset saved", 800);
+          _task->showToast("Preset saved", 800);
         }
         _picker.saving = false;
       } else if (res == KeyboardWidget::CANCELLED) {
@@ -961,7 +978,7 @@ public:
             break;
           case RadioPresetPicker::DELETED:
             _dirty = true;
-            _task->showAlert("Preset deleted", 800);
+            _task->showToast("Preset deleted", 800);
             break;
           case RadioPresetPicker::NONE:
             break;
@@ -1092,6 +1109,19 @@ public:
       _dirty = true;
       return true;
     }
+#if defined(HELTEC_LORA_V4)
+    if (_selected == FEM_LNA && p && (left || right || enter)) {
+      if (!board.canControlLoRaFemLna()) { _task->showAlert("LNA unavailable", 900); return true; }
+      bool enabled = !board.isLoRaFemLnaEnabled();
+      if (board.setLoRaFemLnaEnabled(enabled)) {
+        p->radio_fem_rxgain = enabled ? 1 : 0;
+        _dirty = true;
+      } else {
+        _task->showAlert("LNA change failed", 900);
+      }
+      return true;
+    }
+#endif
 #if AUTO_OFF_MILLIS > 0
     if (_selected == AUTO_OFF && p) {
       int idx = autoOffIndex();

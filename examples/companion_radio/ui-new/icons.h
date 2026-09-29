@@ -593,10 +593,10 @@ inline void drawScrollIndicator(DisplayDriver& d, int right_x, int top_y, int tr
 // using `reserve` to keep right-aligned content clear of the indicator. Returns
 // the visible row count (callers cache it for input handling).
 template <class RenderRow>
-inline int drawList(DisplayDriver& d, int total, int sel, int& scroll, RenderRow row) {
+inline int drawList(DisplayDriver& d, int total, int sel, int& scroll, RenderRow row, int footer_h = 0) {
   const int item_h  = d.lineStep();
   const int start_y = d.listStart();
-  int visible = d.listVisible(item_h);
+  int visible = (d.height() - start_y - footer_h) / item_h;
   if (visible < 1) visible = 1;
   if (sel < scroll)            scroll = sel;
   if (sel >= scroll + visible) scroll = sel - visible + 1;

@@ -24,6 +24,8 @@ enum class UIEventType {
     ack
 };
 
+enum class StorageActivity : uint8_t { Contacts, Advert, Settings };
+
 class AbstractUITask {
 protected:
   mesh::MainBoard* _board;
@@ -41,6 +43,14 @@ public:
     if (prev && !connected) onBLEDisconnected();
   }
   bool hasConnection() const { return _connected; }
+  virtual uint32_t lastUserInputMillis() const { return 0; }
+  virtual bool isDisplayOn() const { return false; }
+  virtual void setStorageBusy(bool busy, StorageActivity activity = StorageActivity::Contacts) {
+    (void)busy; (void)activity;
+  }
+  virtual bool isStorageIndicatorReady() const { return false; }
+  virtual void showStorageBusyNow(StorageActivity activity = StorageActivity::Contacts) { (void)activity; }
+  virtual void showStorageError(StorageActivity activity) { (void)activity; }
   virtual void onBLEDisconnected() {}
   // An end-to-end ACK (CRC) arrived for one of our sent messages — drives the
   // DM delivery-status marker. Default no-op for UIs that don't track it.
@@ -60,6 +70,11 @@ public:
   // Text reply to an on-device-UI-triggered MyMesh::sendAdminCommand() arrived
   // (see AdminScreen). pub_key is the contact's key prefix (>=4 bytes valid).
   virtual void onAdminReply(const uint8_t* pub_key, const char* text) { (void)pub_key; (void)text; }
+  // The fixed header shared by repeater and room status replies.
+  virtual void onRemoteStatus(const uint8_t* pub_key, uint16_t battery_mv, uint16_t queue_len,
+                              int16_t noise_floor, int16_t last_rssi, uint32_t uptime_secs) {
+    (void)pub_key; (void)battery_mv; (void)queue_len; (void)noise_floor; (void)last_rssi; (void)uptime_secs;
+  }
   // Bot action commands (!gps/!buzz, see MyMesh::botCommandReply) -- device
   // state changes triggered remotely, gated by the bot_actions_* prefs.
   // Default no-op so UI variants that don't wire these up just ignore them.

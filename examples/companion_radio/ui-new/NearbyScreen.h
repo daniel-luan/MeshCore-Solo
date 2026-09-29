@@ -2,6 +2,7 @@
 #include "../GeoUtils.h"
 #include "NavView.h"
 #include "TabBar.h"
+#include "GfxUtils.h"
 
 // ── Nearby Nodes ──────────────────────────────────────────────────────────────
 // One list / detail / action-menu interaction path over two sources:
@@ -24,7 +25,7 @@ class NearbyScreen : public UIScreen {
   enum Source : uint8_t { SRC_STORED, SRC_SCAN };
 
   // ── action-menu actions (matched by id, not by row index) ────────────────────
-  enum Action : uint8_t { ACT_NAV, ACT_PING, ACT_WAYPOINT, ACT_LOCATOR,
+  enum Action : uint8_t { ACT_NAV, ACT_PING, ACT_HISTORY, ACT_WAYPOINT, ACT_LOCATOR,
                           ACT_ADD, ACT_DELETE, ACT_FAV, ACT_PIN, ACT_ADMIN, ACT_SORT, ACT_SCAN };
 
   // Set by UITask::pickAdminTarget() (Tools > Admin, which is remote-only):
@@ -73,6 +74,7 @@ class NearbyScreen : public UIScreen {
   int     _sel;
   int     _scroll;
   bool    _detail;
+  bool    _history_view = false;
   bool    _nav = false;     // full-screen navigate-to-node view (over detail)
   navview::EtaTracker _nav_eta;  // closing-speed/ETA for the navigate view
   int32_t _own_lat, _own_lon;
@@ -93,12 +95,57 @@ class NearbyScreen : public UIScreen {
   unsigned long _scan_started_ms;
   static const unsigned long SCAN_DURATION_MS = 8000UL;
 
+  // Eight completed discovery scans per node, held in RAM. A scan contributes
+  // at most one sample, so fast UI redraws cannot skew averages or trends.
+  static const int LINK_NODES = 12;
+  static const int LINK_SAMPLES = 8;
+  struct LinkHistory {
+    uint8_t key[PUB_KEY_SIZE];
+    int8_t rssi[LINK_SAMPLES], snr_x4[LINK_SAMPLES];
+    uint8_t count = 0, head = 0;
+    uint32_t last_ms = 0;
+  };
+  LinkHistory _links[LINK_NODES] = {};
+  uint8_t _link_count = 0;
+
+  const LinkHistory* linkFor(const uint8_t* key) const {
+    for (uint8_t i = 0; i < _link_count; ++i)
+      if (memcmp(_links[i].key, key, PUB_KEY_SIZE) == 0) return &_links[i];
+    return nullptr;
+  }
+
+  void recordScanResults() {
+    static DiscoverResult results[DISCOVER_RESULTS_MAX];
+    int n = the_mesh.getDiscoverResults(results, DISCOVER_RESULTS_MAX);
+    for (int i = 0; i < n; ++i) {
+      int slot = -1;
+      for (int j = 0; j < _link_count; ++j)
+        if (memcmp(_links[j].key, results[i].pub_key, PUB_KEY_SIZE) == 0) { slot = j; break; }
+      if (slot < 0) {
+        if (_link_count < LINK_NODES) slot = _link_count++;
+        else {
+          slot = 0;
+          for (int j = 1; j < LINK_NODES; ++j)
+            if ((int32_t)(_links[j].last_ms - _links[slot].last_ms) < 0) slot = j;
+        }
+        memcpy(_links[slot].key, results[i].pub_key, PUB_KEY_SIZE);
+        _links[slot].count = _links[slot].head = 0;
+      }
+      LinkHistory& h = _links[slot];
+      h.rssi[h.head] = results[i].rssi;
+      h.snr_x4[h.head] = results[i].snr_x4;
+      h.head = (h.head + 1) % LINK_SAMPLES;
+      if (h.count < LINK_SAMPLES) ++h.count;
+      h.last_ms = millis();
+    }
+  }
+
   // ── popups ────────────────────────────────────────────────────────────────────
   PopupMenu _menu;            // unified action menu (Hold Enter), list + detail
   PopupMenu _ping_menu;       // ping (special: read-only result rows)
   PopupMenu _confirm;         // delete-contact confirmation (destructive → 2-step)
 
-  Action  _menu_actions[10];  // parallel to _menu rows — stable action ids
+  Action  _menu_actions[11];  // parallel to _menu rows — stable action ids
   int     _menu_action_count;
   char    _sort_label[16];    // dynamic label for the Sort row
 
@@ -416,16 +463,58 @@ class NearbyScreen : public UIScreen {
     _scanning      = true;
     _scan_started_ms = millis();
     _sel = _scroll = 0;
+    _history_view = false;
     the_mesh.sendNodeDiscoverReq();
     refreshScan();
   }
 
   void leaveScan() {
+    if (_scanning) recordScanResults();
+    _scanning = false;
     _source = SRC_STORED;
     _detail = false;
+    _history_view = false;
     _nav    = false;
     _sel = _scroll = 0;
     refreshStored();
+  }
+
+  void renderLinkHistory(DisplayDriver& display) {
+    const Entry* e = selected();
+    const LinkHistory* h = (e && e->has_key) ? linkFor(e->pub_key) : nullptr;
+    display.drawCenteredHeader("LINK HISTORY");
+    if (!h || !h->count) {
+      display.drawTextCentered(display.width() / 2, display.height() / 2, "Run Discover scan");
+      return;
+    }
+    int oldest = (h->head + LINK_SAMPLES - h->count) % LINK_SAMPLES;
+    int newest = (h->head + LINK_SAMPLES - 1) % LINK_SAMPLES;
+    int sum = 0;
+    for (int i = 0; i < h->count; ++i) sum += h->rssi[(oldest + i) % LINK_SAMPLES];
+    int trend = h->rssi[newest] - h->rssi[oldest];
+    char line[40];
+    snprintf(line, sizeof(line), "RSSI %d  avg %d dBm", (int)h->rssi[newest], sum / h->count);
+    display.setCursor(2, display.listStart()); display.print(line);
+    snprintf(line, sizeof(line), "SNR %.1f  trend %+d dB", h->snr_x4[newest] / 4.0f, trend);
+    display.setCursor(2, display.listStart() + display.lineStep()); display.print(line);
+    int left = 8, right = display.width() - 8;
+    int top = display.listStart() + display.lineStep() * 2 + 1;
+    int bottom = display.height() - display.lineStep() - 3;
+    if (bottom <= top) return;
+    display.drawRect(left, top, right - left, bottom - top + 1);
+    int prev_x = 0, prev_y = 0;
+    for (int i = 0; i < h->count; ++i) {
+      int dbm = h->rssi[(oldest + i) % LINK_SAMPLES];
+      if (dbm < -120) dbm = -120;
+      if (dbm > -30) dbm = -30;
+      int x = left + 2 + (h->count == 1 ? 0 : i * (right - left - 5) / (h->count - 1));
+      int y = bottom - 2 - (dbm + 120) * (bottom - top - 4) / 90;
+      if (i) gfx::drawLine(display, prev_x, prev_y, x, y);
+      display.fillRect(x - 1, y - 1, 3, 3);
+      prev_x = x; prev_y = y;
+    }
+    snprintf(line, sizeof(line), "%d scan%s  Back", h->count, h->count == 1 ? "" : "s");
+    display.drawTextCentered(display.width() / 2, display.height() - display.lineStep(), line);
   }
 
   // Save the currently-selected entry as a waypoint (its name as label).
@@ -599,7 +688,7 @@ class NearbyScreen : public UIScreen {
 
     buildSortLabel();
     _menu_action_count = 0;
-    _menu.begin("Options", 10);
+    _menu.begin("Options", 11);
     auto add = [&](const char* label, Action a) {
       _menu.addItem(label);
       _menu_actions[_menu_action_count++] = a;
@@ -611,6 +700,7 @@ class NearbyScreen : public UIScreen {
 
     if (has_gps) add("Navigate",      ACT_NAV);
     if (has_key) add("Ping",          ACT_PING);
+    if (has_key) add("Link history",  ACT_HISTORY);
     if (has_gps) add("Save waypoint", ACT_WAYPOINT);
     // Only a position is needed: with an identity prefix this becomes a person
     // target that follows them, without one a place target pinned where they were.
@@ -672,6 +762,11 @@ class NearbyScreen : public UIScreen {
         if (e && e->has_key) startPingForKey(e->pub_key);
         break;
       }
+      case ACT_HISTORY:
+        _menu.active = false;
+        _detail = true;
+        _history_view = true;
+        break;
       case ACT_WAYPOINT: saveSelectedWaypoint(); break;
       case ACT_LOCATOR: {
         const Entry* e = selected();
@@ -827,6 +922,7 @@ public:
   void onShow() override {
     _sel = _scroll = 0;
     _detail = false;
+    _history_view = false;
     _nav = false;
     _source = SRC_STORED;
     // _filter / _sort persist across enter() — set once in the constructor
@@ -848,6 +944,11 @@ public:
   int render(DisplayDriver& display) override {
     display.setTextSize(1);
     int mq_delay = 0;   // >0 while the selected row's name is marquee-scrolling
+
+    if (_source == SRC_SCAN && _scanning && millis() - _scan_started_ms >= SCAN_DURATION_MS) {
+      recordScanResults();
+      _scanning = false;
+    }
 
     // Periodic refresh of the selected entry while in detail or navigate view,
     // preserving the selection across the list rebuild. Navigate refreshes
@@ -873,16 +974,16 @@ public:
 
     // ── detail view ──────────────────────────────────────────────────────────
     if (_detail && _sel < _count) {
-      if (_source == SRC_SCAN) renderScanDetail(display);
+      if (_history_view)          renderLinkHistory(display);
+      else if (_source == SRC_SCAN) renderScanDetail(display);
       else                     renderStoredDetail(display);
-      renderActivePopup(display);
+      if (!_history_view) renderActivePopup(display);
       return _ping_menu.active ? 50 : 2000;
     }
 
     // ── list view ────────────────────────────────────────────────────────────
     if (_source == SRC_SCAN) {
       refreshScan();
-      if (_scanning && millis() - _scan_started_ms >= SCAN_DURATION_MS) _scanning = false;
     } else if (millis() - _list_refresh_ms >= TIME_LIST_REFRESH_MS) {
       // Re-merge + re-sort periodically so newly-heard contacts and fresh live
       // [LOC] shares bubble to the right spot under either sort (distances move
@@ -968,8 +1069,16 @@ public:
           else                   strncpy(right, "?GPS", sizeof(right));
         }
         display.drawTextRightAlign(display.width() - reserve - 2, y, right);
-      });
+      }, display.getLineHeight() + 1);
     }
+
+    display.setColor(DisplayDriver::DARK);
+    display.fillRect(0, display.height() - display.getLineHeight() - 1,
+                     display.width(), display.getLineHeight() + 1);
+    display.setColor(DisplayDriver::LIGHT);
+    display.drawTextCentered(display.width() / 2,
+                             display.height() - display.getLineHeight() - 1,
+                             "OK Details  Back Exit");
 
     if (renderActivePopup(display)) return 50;
     int ret;
@@ -979,6 +1088,10 @@ public:
   }
 
   bool handleInput(char c) override {
+    if (_history_view) {
+      if (c == KEY_CANCEL || c == KEY_ENTER) _history_view = false;
+      return true;
+    }
     // ── navigate-to-node view — any nav key returns to detail ─────────────────
     if (_nav) {
       if (c == KEY_CANCEL) _nav = false;   // only Back leaves a navigate view
@@ -1019,6 +1132,7 @@ public:
     if (_detail) {
       if (c == KEY_CANCEL)            { _detail = false; closePingMenu(); return true; }
       if (c == KEY_CONTEXT_MENU)      { openActionMenu(); return true; }
+      if (c == KEY_ENTER)             { _history_view = true; return true; }
       return true;
     }
 

@@ -1194,6 +1194,20 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
       success = false;
     }
     _ui->onRoomLoginResult(contact.id.pub_key, success, permissions);
+  } else if (len >= 28 && ui_pending_status_tag && tag == ui_pending_status_tag &&
+             memcmp(&ui_pending_status_from, contact.id.pub_key, 4) == 0) {
+    // RepeaterStats and ServerStats share this 24-byte prefix. Copy fields by
+    // offset so optional fields at the end never affect the on-device view.
+    ui_pending_status_tag = 0;
+    uint16_t battery, queue;
+    int16_t noise, rssi;
+    uint32_t uptime;
+    memcpy(&battery, data + 4, 2);
+    memcpy(&queue, data + 6, 2);
+    memcpy(&noise, data + 8, 2);
+    memcpy(&rssi, data + 10, 2);
+    memcpy(&uptime, data + 24, 4);
+    if (_ui) _ui->onRemoteStatus(contact.id.pub_key, battery, queue, noise, rssi, uptime);
   } else if (len > 4 && // check for status response
              pending_status &&
              memcmp(&pending_status, contact.id.pub_key, 4) == 0 // legacy matching scheme
@@ -3433,10 +3447,68 @@ void MyMesh::loop() {
   }
 
   // is there are pending dirty contacts write needed?
+#if defined(ESP32) && defined(FIRMWARE_SOLO_BUILD)
+  // Flash metadata operations can stall for hundreds of milliseconds on
+  // SPIFFS. Keep them away from active joystick navigation. After a minute,
+  // allow the pending save through so contact updates are not held forever.
+  uint32_t now_ms = millis();
+  uint32_t last_input_ms = _ui ? _ui->lastUserInputMillis() : 0;
+  bool input_recent = last_input_ms && (uint32_t)(now_ms - last_input_ms) < 3000;
+  bool save_overdue = _store->isContactSaveBusy()
+    ? (uint32_t)(now_ms - _store->contactSaveStartedMillis()) >= 60000
+    : dirty_contacts_expiry && (int32_t)(now_ms - (dirty_contacts_expiry + 60000)) >= 0;
+  bool contact_write_allowed = !input_recent || save_overdue;
+  if (_store->isContactSaveBusy() && contact_write_allowed) {
+    if (_ui) _ui->setStorageBusy(true);
+    // Give the UI one full loop to put the indicator on the OLED before a
+    // blocking flash call. When the screen is dark, write immediately.
+    if (!_ui || !_ui->isDisplayOn() || _ui->isStorageIndicatorReady()) {
+      _store->stepContactSave();
+    }
+  }
+  if (_store->takeContactSaveFailure()) {
+    if (_ui) _ui->showStorageError(StorageActivity::Contacts);
+    dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  }
+  if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry) && !_store->isContactSaveBusy()
+      && contact_write_allowed) {
+    // Snapshot allocation can fail under memory pressure; retain the old
+    // synchronous path so a contact update is still persisted in that case.
+    if (!_store->startContactSaveDeferred(this, save_filter)) saveContacts();
+    dirty_contacts_expiry = 0;
+    if (_store->isContactSaveBusy() && _ui) _ui->setStorageBusy(true);
+  }
+#if defined(DEFER_ADVERT_FLASH)
+  // A received advert only needs its raw packet on flash for sharing after a
+  // restart. Keep the latest packet in RAM for immediate Share use and drain
+  // one flash write at a time after the joystick has been quiet.
+  bool advert_write_allowed = !_store->isContactSaveBusy()
+    && (!last_input_ms || (uint32_t)(millis() - last_input_ms) >= 5000)
+    && _store->hasPendingAdvertWrites();
+  if (advert_write_allowed) {
+    if (_ui) _ui->setStorageBusy(true, StorageActivity::Advert);
+    if (!_ui || !_ui->isDisplayOn() || _ui->isStorageIndicatorReady()) {
+      _store->stepPendingAdvertWrite();
+    }
+  }
+  if (_ui) {
+    if (_store->isContactSaveBusy() && contact_write_allowed) {
+      _ui->setStorageBusy(true, StorageActivity::Contacts);
+    } else if (advert_write_allowed && _store->hasPendingAdvertWrites()) {
+      _ui->setStorageBusy(true, StorageActivity::Advert);
+    } else {
+      _ui->setStorageBusy(false);
+    }
+  }
+#else
+  if (_ui) _ui->setStorageBusy(_store->isContactSaveBusy() && contact_write_allowed);
+#endif
+#else
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
     saveContacts();
     dirty_contacts_expiry = 0;
   }
+#endif
 
   if (_prefs.advert_auto_interval_sec > 0 && millisHasNowPassed(_next_auto_advert_ms)) {
     mesh::Packet* pkt = (sensors.node_lat != 0 || sensors.node_lon != 0)

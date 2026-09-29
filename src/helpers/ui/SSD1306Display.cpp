@@ -1,4 +1,5 @@
 #include "SSD1306Display.h"
+#include <helpers/DeviceTiming.h>
 #ifdef OLED_MISC_FIXED_FONT
   #include "MiscFixedRenderer.h"
 #endif
@@ -21,6 +22,9 @@ bool SSD1306Display::begin() {
 }
 
 void SSD1306Display::turnOn() {
+#ifdef SSD1306_SKIP_UNCHANGED_FRAMES
+  _force_redraw = true;
+#endif
   if (!_isOn) {
     if (_peripher_power) _peripher_power->claim();
     _isOn = true;  // set before begin() to prevent double claim
@@ -45,6 +49,9 @@ void SSD1306Display::turnOff() {
 void SSD1306Display::clear() {
   display.clearDisplay();
   display.display();
+#ifdef SSD1306_SKIP_UNCHANGED_FRAMES
+  _force_redraw = true;
+#endif
 }
 
 void SSD1306Display::startFrame(Color bkg) {
@@ -108,5 +115,17 @@ uint16_t SSD1306Display::getTextWidth(const char* str) {
 }
 
 void SSD1306Display::endFrame() {
+#ifdef SSD1306_SKIP_UNCHANGED_FRAMES
+  const uint8_t* buf = display.getBuffer();
+  uint16_t n = (uint16_t)((width() * height()) / 8);
+  uint32_t h = 2166136261u;
+  for (uint16_t i = 0; i < n; i++) { h ^= buf[i]; h *= 16777619u; }
+  if (!_force_redraw && h == _last_frame_hash) return;
+  _force_redraw = false;
+  _last_frame_hash = h;
+#endif
+#ifdef FIRMWARE_SOLO_BUILD
+  ScopedDeviceTiming timing(DeviceTiming::OLED_FLUSH);
+#endif
   display.display();
 }

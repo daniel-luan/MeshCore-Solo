@@ -337,7 +337,26 @@ public:
     return true;
   }
 
-  void savePrefs() { _store->savePrefs(_prefs, sensors.node_lat, sensors.node_lon); }
+  bool sendUiStatusRequest(const ContactInfo& contact, uint32_t& est_timeout) {
+    uint32_t tag = 0;
+    if (sendRequest(contact, REQ_TYPE_GET_STATUS, tag, est_timeout) == MSG_SEND_FAILED)
+      return false;
+    ui_pending_status_tag = tag;
+    memcpy(&ui_pending_status_from, contact.id.pub_key, 4);
+    return true;
+  }
+
+  bool savePrefs() {
+#ifdef FIRMWARE_SOLO_BUILD
+    if (_ui) _ui->showStorageBusyNow(StorageActivity::Settings);
+#endif
+    bool saved = _store->savePrefs(_prefs, sensors.node_lat, sensors.node_lon);
+#ifdef FIRMWARE_SOLO_BUILD
+    if (_ui) _ui->setStorageBusy(false);
+    if (!saved && _ui) _ui->showStorageError(StorageActivity::Settings);
+#endif
+    return saved;
+  }
   void saveRTCTime() { _store->saveRTCTime(); }
   // Contact updates (new adverts, path/lastmod changes) are lazily debounced
   // (see dirty_contacts_expiry) to avoid wearing flash on every packet --
@@ -346,7 +365,32 @@ public:
   // this before rebooting; UITask::shutdown() (low-battery auto-shutdown,
   // long-press power-off) needs the same flush or a whole session's worth
   // of learned contacts can be lost.
-  void flushDirtyContacts() { if (dirty_contacts_expiry) { saveContacts(); dirty_contacts_expiry = 0; } }
+  void flushDirtyContacts() {
+#if defined(ESP32) && defined(FIRMWARE_SOLO_BUILD)
+    bool has_storage_work = _store->isContactSaveBusy() || dirty_contacts_expiry;
+#if defined(DEFER_ADVERT_FLASH)
+    has_storage_work = has_storage_work || _store->hasPendingAdvertWrites();
+#endif
+    if (has_storage_work && _ui) {
+      StorageActivity activity = (_store->isContactSaveBusy() || dirty_contacts_expiry)
+        ? StorageActivity::Contacts : StorageActivity::Advert;
+      _ui->showStorageBusyNow(activity);
+    }
+    _store->finishContactSave();
+    bool save_failed = _store->takeContactSaveFailure();
+    if (save_failed && _ui) _ui->showStorageError(StorageActivity::Contacts);
+#if defined(DEFER_ADVERT_FLASH)
+    _store->finishPendingAdvertWrites();
+#endif
+#else
+    bool save_failed = false;
+#endif
+    if (dirty_contacts_expiry || save_failed) { saveContacts(); dirty_contacts_expiry = 0; }
+#if defined(ESP32) && defined(FIRMWARE_SOLO_BUILD)
+    if (_store->takeContactSaveFailure() && _ui) _ui->showStorageError(StorageActivity::Contacts);
+#endif
+    if (_ui) _ui->setStorageBusy(false);
+  }
   DataStore* getDataStore() const { return _store; }
   void applyApc();   // (re)initialise Adaptive Power Control from prefs
   // Adaptive Power Control is suppressed while repeating: a repeater wants full,
@@ -510,6 +554,8 @@ private:
   uint32_t ui_pending_login;  // like pending_login, but triggered by on-device UI instead of BLE/USB app
   char pending_login_pw[16];  // password of the in-flight app/USB login, persisted on success for ADV_TYPE_ROOM (see saveRoomPassword)
   uint32_t ui_pending_admin_reply;  // pub_key prefix of the contact AdminScreen's sendAdminCommand() is awaiting a CLI reply from
+  uint32_t ui_pending_status_tag = 0;
+  uint32_t ui_pending_status_from = 0;
   uint32_t pending_status;
   uint32_t pending_telemetry, pending_discovery;   // pending _TELEMETRY_REQ
   uint32_t pending_req;   // pending _BINARY_REQ

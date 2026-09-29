@@ -1,6 +1,9 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
+#include <helpers/DeviceTiming.h>
 #include "MyMesh.h"
+
+DeviceTiming device_timing;
 
 #if defined(SIM_PLATFORM) && defined(__EMSCRIPTEN__)
 // Phase 3: true only once setup() has fully finished (set at the very end
@@ -226,7 +229,58 @@ void setup() {
   #endif
     the_mesh.startInterface(serial_interface);
 #elif defined(ESP32)
+#if defined(SOLO_SAFE_STORAGE)
+  // A mount error may be transient. Never erase an existing device's data as
+  // a side effect of booting; require a deliberate five-second PRG hold.
+  if (!SPIFFS.begin(false)) {
+    Serial.println("Storage mount failed. Files were not erased.");
+    pinMode(PIN_BACK_BTN, INPUT_PULLUP);
+    uint32_t held_since = 0;
+    uint32_t next_draw = 0;
+    bool format_failed = false;
+    for (;;) {
+      uint32_t now = millis();
+      bool held = digitalRead(PIN_BACK_BTN) == LOW;
+      if (held) {
+        if (!held_since) held_since = now;
+        if ((uint32_t)(now - held_since) >= 5000) {
+#ifdef DISPLAY_CLASS
+          if (disp && disp->isOn()) {
+            disp->startFrame();
+            disp->setTextSize(1);
+            disp->drawTextCentered(disp->width() / 2, disp->height() / 2, "Erasing storage...");
+            disp->endFrame();
+          }
+#endif
+          if (SPIFFS.format()) board.reboot();
+          format_failed = true;
+          held_since = now;  // another hold can retry a failed format
+        }
+      } else held_since = 0;
+#ifdef DISPLAY_CLASS
+      if (disp && disp->isOn() && (int32_t)(now - next_draw) >= 0) {
+        disp->startFrame();
+        disp->setTextSize(1);
+        int step = disp->lineStep();
+        int y = (disp->height() - step * 4) / 2;
+        disp->drawTextCentered(disp->width() / 2, y, "Storage unavailable");
+        disp->drawTextCentered(disp->width() / 2, y + step, "Files not erased");
+        disp->drawTextCentered(disp->width() / 2, y + step * 2,
+                               format_failed ? "Erase failed" : "Power cycle to retry");
+        disp->drawTextCentered(disp->width() / 2, y + step * 3, "Hold PRG 5s: erase");
+        disp->endFrame();
+        next_draw = now + 500;
+      }
+#endif
+#ifdef HAS_EXTERNAL_WATCHDOG
+      external_watchdog.loop();
+#endif
+      delay(20);
+    }
+  }
+#else
   SPIFFS.begin(true);
+#endif
   store.begin();
   the_mesh.begin(
     #ifdef DISPLAY_CLASS
@@ -311,10 +365,25 @@ void loop() {
 #ifdef NRF52_PLATFORM
   NRF_WDT->RR[0] = 0x6E524635UL;  // pet watchdog
 #endif
-  the_mesh.loop();
-  sensors.loop();
+  {
+#ifdef FIRMWARE_SOLO_BUILD
+    ScopedDeviceTiming timing(DeviceTiming::MESH_LOOP);
+#endif
+    the_mesh.loop();
+  }
+  {
+#ifdef FIRMWARE_SOLO_BUILD
+    ScopedDeviceTiming timing(DeviceTiming::SENSOR_LOOP);
+#endif
+    sensors.loop();
+  }
 #ifdef DISPLAY_CLASS
-  ui_task.loop();
+  {
+#ifdef FIRMWARE_SOLO_BUILD
+    ScopedDeviceTiming timing(DeviceTiming::UI_LOOP);
+#endif
+    ui_task.loop();
+  }
 #endif
   rtc_clock.tick();
 #ifdef HAS_EXTERNAL_WATCHDOG

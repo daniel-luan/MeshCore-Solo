@@ -52,6 +52,10 @@ class UITask : public AbstractUITask {
   GenericVibration vibration;
 #endif
   unsigned long _next_refresh, _auto_off;
+  uint32_t _last_user_input_ms = 0;
+  bool _storage_busy = false;
+  bool _storage_indicator_ready = false;
+  StorageActivity _storage_activity = StorageActivity::Contacts;
   NodePrefs* _node_prefs;
   bool _locked;
   unsigned long _lock_wake_until;  // when to blank screen again after locked wake (5s)
@@ -59,6 +63,7 @@ class UITask : public AbstractUITask {
   unsigned long _lock_seq_ms;      // millis() of last lock-sequence press (for timeout)
   bool _lock_seq_used;             // true = suppress next back_btn CLICK (post-sequence release)
   char _alert[80];
+  bool _alert_toast = false;
   char _notif_mel_buf[220];  // persistent RTTTL buffer for custom notification melodies
   // Persistent RTTTL buffer for the bot !buzz command (see botBuzz()) -- sized
   // for the full 30s cap: "Buzz:b=120:" (11B) + up to 60 "8c,8p," pairs (6B
@@ -289,6 +294,7 @@ private:
   // Shared by the normal render path and the lock screen (so a ringing
   // alarm's label is visible while locked).
   void renderAlertOverlay();
+  void renderStorageOverlay();
 
 public:
 
@@ -306,6 +312,12 @@ public:
     memset(_dm_unread_table, 0, sizeof(_dm_unread_table));
     curr = NULL;
   }
+  uint32_t lastUserInputMillis() const override { return _last_user_input_ms; }
+  bool isDisplayOn() const override { return _display && _display->isOn(); }
+  void setStorageBusy(bool busy, StorageActivity activity = StorageActivity::Contacts) override;
+  bool isStorageIndicatorReady() const override { return _storage_busy && _storage_indicator_ready; }
+  void showStorageBusyNow(StorageActivity activity = StorageActivity::Contacts) override;
+  void showStorageError(StorageActivity activity) override;
   void begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* node_prefs);
   void onBLEDisconnected() override { _next_refresh = 0; }
 
@@ -428,6 +440,7 @@ public:
   void stopMelody();
   bool isMelodyPlaying();
   void showAlert(const char* text, int duration_millis);
+  void showToast(const char* text, int duration_millis);
   int  addChannelMsg(uint8_t channel_idx, const char* text, uint32_t timestamp = 0,
                      const uint8_t* path = nullptr, uint8_t path_len = 0,
                      bool own_message = false) override;
@@ -439,6 +452,8 @@ public:
   void onChannelRelayed(uint32_t seq, const uint8_t* repeater_hash = nullptr, uint8_t hash_size = 0) override;
   void onRoomLoginResult(const uint8_t* pub_key, bool success, uint8_t permissions) override;
   void onAdminReply(const uint8_t* pub_key, const char* text) override;
+  void onRemoteStatus(const uint8_t* pub_key, uint16_t battery_mv, uint16_t queue_len,
+                      int16_t noise_floor, int16_t last_rssi, uint32_t uptime_secs) override;
   int  getDMUnreadTotal() const;
   int  getMsgCount() const { return _msgcount; }
   int  getChannelUnreadCount() const;

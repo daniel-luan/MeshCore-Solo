@@ -70,7 +70,7 @@ class AdminScreen : public UIScreen {
   bool    _admin_ok = false;
 
   // ── COMMAND: category tabs / rows ───────────────────────────────────────────
-  enum AdminTab : uint8_t { ATAB_SYSTEM, ATAB_RADIO, ATAB_ROUTING, ATAB_ACTIONS, ATAB_COUNT };
+  enum AdminTab : uint8_t { ATAB_HEALTH, ATAB_SYSTEM, ATAB_RADIO, ATAB_ROUTING, ATAB_ACTIONS, ATAB_COUNT };
   static const char* TAB_LABELS[ATAB_COUNT];
 
   // Most fields are still free text (get reply pre-fills the keyboard, user
@@ -104,10 +104,12 @@ class AdminScreen : public UIScreen {
   static const AdminField RADIO_FIELDS[];
   static const AdminField ROUTING_FIELDS[];
   static const AdminField ACTION_FIELDS[];
+  static const AdminField HEALTH_FIELDS[];
   static const int ROWS_PER_TAB[ATAB_COUNT];
 
   static const AdminField& fieldAt(int tab, int row) {
     switch (tab) {
+      case ATAB_HEALTH:  return HEALTH_FIELDS[row];
       case ATAB_SYSTEM:  return SYSTEM_FIELDS[row];
       case ATAB_RADIO:   return RADIO_FIELDS[row];
       case ATAB_ROUTING: return ROUTING_FIELDS[row];
@@ -117,6 +119,50 @@ class AdminScreen : public UIScreen {
 
   uint8_t _tab = 0;
   int     _row_sel = 0, _row_scroll = 0;
+
+  // Read-only remote snapshot. One request at a time keeps replies associated
+  // with their row and avoids flooding a slow multi-hop path.
+  static const uint8_t HEALTH_COUNT = 3;
+  char _health_values[HEALTH_COUNT][32] = {};
+  char _status_values[4][20] = {};
+  char _health_neighbors[200] = {};
+  uint32_t _health_updated_ms = 0;
+  int8_t _health_pending = -1;
+  uint8_t _health_next = HEALTH_COUNT;
+  bool _status_needs_request = false;
+  bool _status_waiting = false;
+  uint32_t _status_deadline_ms = 0;
+
+  void requestNextHealth() {
+    static const char* const commands[HEALTH_COUNT] = {
+      "ver", "board", "neighbors"
+    };
+    while (_health_next < HEALTH_COUNT) {
+      int row = _health_next++;
+      strncpy(_cmd_text, commands[row], sizeof(_cmd_text) - 1);
+      _cmd_text[sizeof(_cmd_text) - 1] = '\0';
+      uint32_t timeout = 0;
+      if (the_mesh.sendAdminCommand(_target, _cmd_text, timeout)) {
+        _health_pending = row;
+        _waiting = true;
+        _cmd_deadline_ms = millis() + timeout + 4000;
+        return;
+      }
+      strncpy(_health_values[row], "Send failed", sizeof(_health_values[row]) - 1);
+    }
+    _health_pending = -1;
+    _health_updated_ms = millis();
+  }
+
+  void refreshHealth() {
+    for (uint8_t i = 0; i < HEALTH_COUNT; ++i) strcpy(_health_values[i], "...");
+    for (uint8_t i = 0; i < 4; ++i) strcpy(_status_values[i], "...");
+    _health_neighbors[0] = '\0';
+    _health_next = 0;
+    _health_updated_ms = 0;
+    _status_needs_request = true;
+    _status_waiting = false;
+  }
 
   bool        _kb_active = false;
   char        _cmd_text[161] = "";           // the command being built/sent
@@ -356,6 +402,13 @@ public:
     _admin_ok = false;
     _confirm.active = false;
     _pending_confirm_field = nullptr;
+    _health_pending = -1;
+    _health_next = HEALTH_COUNT;
+    _status_needs_request = false;
+    _status_waiting = false;
+    _health_updated_ms = 0;
+    for (uint8_t i = 0; i < HEALTH_COUNT; ++i) _health_values[i][0] = '\0';
+    _health_neighbors[0] = '\0';
   }
 
   // Canonical entry for a specific target -- called by UITask::openAdminFor(),
@@ -366,8 +419,9 @@ public:
     _target = ci;
     _from_picker = from_picker;
     if (isAdminOk(ci.id.pub_key)) {
-      _tab = ATAB_SYSTEM; _row_sel = _row_scroll = 0;
+      _tab = ATAB_HEALTH; _row_sel = _row_scroll = 0;
       _phase = COMMAND;
+      refreshHealth();
     } else {
       char saved_pw[sizeof(_login_pw)];
       if (the_mesh.getRoomPassword(ci.id.pub_key, saved_pw, sizeof(saved_pw)))
@@ -395,10 +449,11 @@ public:
       memcpy(_admin_ok_prefix, pub_key, 4);
       _admin_ok = true;
       the_mesh.saveRoomPassword(pub_key, _login_pw);   // remember it -- same logic as room login
-      _tab = ATAB_SYSTEM;
+      _tab = ATAB_HEALTH;
       _row_sel = _row_scroll = 0;
       _phase = COMMAND;
       _task->showAlert("Logged in (admin)", 1000);
+      refreshHealth();
     } else if (success) {
       // Correct password, just insufficient permission -- leave any saved
       // password alone, retyping the same one won't change the outcome.
@@ -417,6 +472,29 @@ public:
   void onAdminReply(const uint8_t* pub_key, const char* text) {
     if (!_waiting || memcmp(_target.id.pub_key, pub_key, 4) != 0) return;
     _waiting = false;
+    if (_health_pending >= 0) {
+      int row = _health_pending;
+      _health_pending = -1;
+      const char* value = (text[0] == '>' && text[1] == ' ') ? text + 2 : text;
+      if (row == 2) {
+        strncpy(_health_neighbors, value, sizeof(_health_neighbors) - 1);
+        _health_neighbors[sizeof(_health_neighbors) - 1] = '\0';
+        int count = 0;
+        for (const char* p = value; *p; ++p) if (*p == ':') ++count;
+        if (!strncmp(value, "Err", 3) || !strncmp(value, "Error", 5))
+          strcpy(_health_values[row], "N/A");
+        else if (count) snprintf(_health_values[row], sizeof(_health_values[row]), "%d recent", count);
+        else snprintf(_health_values[row], sizeof(_health_values[row]), "%s", value[0] ? "None" : "No reply");
+      } else {
+        size_t i = 0;
+        while (value[i] && value[i] != '\r' && value[i] != '\n' && i < sizeof(_health_values[row]) - 1) {
+          _health_values[row][i] = value[i]; ++i;
+        }
+        _health_values[row][i] = '\0';
+        if (!i) strcpy(_health_values[row], "N/A");
+      }
+      return;
+    }
     // Every "get ..." reply comes back as "> value" (see CommonCLI::handleGetCmd) --
     // strip that CLI-decoration prefix before parsing/pre-filling from it. The
     // final free-form REPLY view still shows `text` raw: action confirmations
@@ -465,7 +543,37 @@ public:
     _phase = REPLY;
   }
 
+  void onRemoteStatus(const uint8_t* pub_key, uint16_t battery_mv, uint16_t queue_len,
+                      int16_t noise_floor, int16_t last_rssi, uint32_t uptime_secs) {
+    if (!_status_waiting || memcmp(_target.id.pub_key, pub_key, 4) != 0) return;
+    _status_waiting = false;
+    if (battery_mv) snprintf(_status_values[0], sizeof(_status_values[0]), "%.2f V", battery_mv / 1000.0f);
+    else strcpy(_status_values[0], "N/A");
+    snprintf(_status_values[1], sizeof(_status_values[1]), "%lud %luh",
+             (unsigned long)(uptime_secs / 86400), (unsigned long)((uptime_secs / 3600) % 24));
+    snprintf(_status_values[2], sizeof(_status_values[2]), "%u", (unsigned)queue_len);
+    snprintf(_status_values[3], sizeof(_status_values[3]), "%d/%d", (int)noise_floor, (int)last_rssi);
+    _health_updated_ms = millis();
+  }
+
   void poll() override {
+    if (_phase == COMMAND && _tab == ATAB_HEALTH && !_waiting && _status_needs_request) {
+      _status_needs_request = false;
+      uint32_t timeout = 0;
+      if (the_mesh.sendUiStatusRequest(_target, timeout)) {
+        _status_waiting = true;
+        _status_deadline_ms = millis() + timeout + 4000;
+      } else {
+        for (uint8_t i = 0; i < 4; ++i) strcpy(_status_values[i], "Send failed");
+      }
+    }
+    if (_status_waiting && (int32_t)(millis() - _status_deadline_ms) >= 0) {
+      _status_waiting = false;
+      for (uint8_t i = 0; i < 4; ++i) strcpy(_status_values[i], "No response");
+    }
+    if (_phase == COMMAND && _tab == ATAB_HEALTH && !_waiting && !_status_waiting && !_status_needs_request &&
+        _health_next < HEALTH_COUNT)
+      requestNextHealth();
     if (_phase == LOGIN && _login_waiting && (int32_t)(millis() - _login_deadline_ms) >= 0) {
       _login_waiting = false;
       // Stop tracking this request on the MyMesh side too -- otherwise a reply
@@ -485,7 +593,16 @@ public:
     }
     if (_phase == COMMAND && _waiting && (int32_t)(millis() - _cmd_deadline_ms) >= 0) {
       _waiting = false;
-      if (_fetch_for_edit)       { fallBackToBlankEdit(); _task->showAlert("Fetch failed - enter value", 1400); }
+      if (_health_pending >= 0) {
+        strcpy(_health_values[_health_pending], "No response");
+        _health_pending = -1;
+        // A delayed reply has no command ID. Stop here so it cannot be
+        // mistaken for the next field's reply.
+        for (uint8_t i = _health_next; i < HEALTH_COUNT; ++i)
+          strcpy(_health_values[i], "Skipped");
+        _health_next = HEALTH_COUNT;
+        _health_updated_ms = millis();
+      } else if (_fetch_for_edit) { fallBackToBlankEdit(); _task->showAlert("Fetch failed - enter value", 1400); }
       else if (_fetch_for_value) { _fetch_for_value = false; _task->showAlert("Fetch failed - try again", 1400); }
       else                       { _task->showAlert("No response (timeout)", 1600); }
     }
@@ -507,7 +624,7 @@ public:
 
     if (_phase == COMMAND) {
       if (_kb_active) return kb().render(display);
-      if (_waiting) {
+      if (_waiting && _tab != ATAB_HEALTH) {
         char title[24];
         snprintf(title, sizeof(title), "%.23s", _target.name);
         display.drawCenteredHeader(title);
@@ -521,16 +638,31 @@ public:
       drawList(display, n, _row_sel, _row_scroll, [&](int i, int y, bool sel, int reserve) {
         drawRowSelection(display, y, sel, reserve);
         const AdminField& f = fieldAt(_tab, i);
-        bool show_val = _value_editing && sel;   // the row whose typed editor is currently open
+        bool show_val = (_value_editing && sel) || (_tab == ATAB_HEALTH);
         // Leave room for the value column on the row currently showing one, so a
         // long label (e.g. "Flood advert interval (h)") can't run under/through
         // the value being edited -- only rows without an inline value get the
         // full row width.
-        int label_max = show_val ? display.valCol() - 4 : display.width() - 4 - reserve;
+        int label_max = (_tab == ATAB_HEALTH) ? display.width() - display.getCharWidth() * 10 - 6
+                      : show_val ? display.valCol() - 4 : display.width() - 4 - reserve;
         int r = display.drawTextEllipsized(2, y, label_max, f.label, sel);
         if (sel && r > 0) mq_delay = r;
         if (show_val) {
-          if (f.kind == FK_RADIO_FREQ) {
+          if (_tab == ATAB_HEALTH) {
+            char shown[11];
+            if (i == 0) {
+              if (_status_waiting || _status_needs_request || _health_next < HEALTH_COUNT || _waiting)
+                strcpy(shown, "Fetching");
+              else if (_health_updated_ms)
+                snprintf(shown, sizeof(shown), "%lus ago", (unsigned long)((millis() - _health_updated_ms) / 1000));
+              else strcpy(shown, "Ready");
+            } else {
+              const char* src = (i <= 4) ? _status_values[i - 1] : _health_values[i - 5];
+              strncpy(shown, src, sizeof(shown) - 1);
+              shown[sizeof(shown) - 1] = '\0';
+            }
+            display.drawTextRightAlign(display.width() - reserve - 2, y, shown);
+          } else if (f.kind == FK_RADIO_FREQ) {
             // valCol() reserves exactly the 8-char width this editor draws (4
             // int + '.' + 3 dec), so with no margin to spare, a visible
             // scrollbar's reserve column would otherwise swallow the last
@@ -546,6 +678,7 @@ public:
       });
       if (_confirm.active) { _confirm.render(display); return 50; }
       if (_value_editing) return 50;
+      if (_tab == ATAB_HEALTH && _waiting) return 250;
       return (mq_delay > 0 && mq_delay < 2000) ? mq_delay : 2000;
     }
 
@@ -661,18 +794,33 @@ public:
       if (_waiting) {
         if (c == KEY_CANCEL) {
           _waiting = false;
+          if (_health_pending >= 0) {
+            _health_pending = -1;
+            _health_next = HEALTH_COUNT;
+            _status_needs_request = false;
+          }
           if (_fetch_for_edit)       fallBackToBlankEdit();
           else if (_fetch_for_value) _fetch_for_value = false;
         }
         return true;
       }
       if (c == KEY_CANCEL) { returnToOrigin(); return true; }
-      if (keyIsPrev(c)) { _tab = (_tab + ATAB_COUNT - 1) % ATAB_COUNT; _row_sel = _row_scroll = 0; return true; }
-      if (keyIsNext(c)) { _tab = (_tab + 1) % ATAB_COUNT;             _row_sel = _row_scroll = 0; return true; }
+      if (keyIsPrev(c)) { _tab = (_tab + ATAB_COUNT - 1) % ATAB_COUNT; _row_sel = _row_scroll = 0; if (_tab == ATAB_HEALTH && !_health_updated_ms) refreshHealth(); return true; }
+      if (keyIsNext(c)) { _tab = (_tab + 1) % ATAB_COUNT;             _row_sel = _row_scroll = 0; if (_tab == ATAB_HEALTH && !_health_updated_ms) refreshHealth(); return true; }
       int n = ROWS_PER_TAB[_tab];
       if (c == KEY_UP)   { _row_sel = (_row_sel > 0) ? _row_sel - 1 : n - 1; return true; }
       if (c == KEY_DOWN) { _row_sel = (_row_sel < n - 1) ? _row_sel + 1 : 0; return true; }
-      if (c == KEY_ENTER) { activateField(fieldAt(_tab, _row_sel)); return true; }
+      if (c == KEY_ENTER) {
+        if (_tab == ATAB_HEALTH) {
+          if (_row_sel == 0) refreshHealth();
+          else if (_row_sel == 7 && _health_neighbors[0]) {
+            strncpy(_reply_text, _health_neighbors, sizeof(_reply_text) - 1);
+            _reply_text[sizeof(_reply_text) - 1] = '\0';
+            _reply_view.begin(); _phase = REPLY;
+          }
+        } else activateField(fieldAt(_tab, _row_sel));
+        return true;
+      }
       return true;
     }
 
@@ -683,7 +831,18 @@ public:
   }
 };
 
-const char* AdminScreen::TAB_LABELS[AdminScreen::ATAB_COUNT] = { "System", "Radio", "Routing", "Actions" };
+const char* AdminScreen::TAB_LABELS[AdminScreen::ATAB_COUNT] = { "Health", "System", "Radio", "Routing", "Actions" };
+
+const AdminScreen::AdminField AdminScreen::HEALTH_FIELDS[] = {
+  { "Refresh", nullptr, nullptr },
+  { "Battery", nullptr, nullptr },
+  { "Uptime", nullptr, nullptr },
+  { "Queue", nullptr, nullptr },
+  { "RF", nullptr, nullptr },
+  { "Version", nullptr, nullptr },
+  { "Board", nullptr, nullptr },
+  { "Nbrs", nullptr, nullptr },
+};
 
 const AdminScreen::AdminField AdminScreen::SYSTEM_FIELDS[] = {
   { "Name",           "get name",       "set name" },
@@ -716,6 +875,7 @@ const AdminScreen::AdminField AdminScreen::ACTION_FIELDS[] = {
 };
 
 const int AdminScreen::ROWS_PER_TAB[AdminScreen::ATAB_COUNT] = {
+  sizeof(AdminScreen::HEALTH_FIELDS)  / sizeof(AdminScreen::AdminField),
   sizeof(AdminScreen::SYSTEM_FIELDS)  / sizeof(AdminScreen::AdminField),
   sizeof(AdminScreen::RADIO_FIELDS)   / sizeof(AdminScreen::AdminField),
   sizeof(AdminScreen::ROUTING_FIELDS) / sizeof(AdminScreen::AdminField),
