@@ -48,6 +48,8 @@ class MicroNMEALocationProvider : public LocationProvider {
     int _pin_en;
     unsigned long next_check = 0;
     long time_valid = 0;
+    uint32_t _last_fix_ms = 0;
+    bool _has_fresh_fix = false;
     unsigned long _last_time_sync = 0;
     static const unsigned long TIME_SYNC_INTERVAL = 1800000; // Re-sync every 30 minutes
 
@@ -76,6 +78,7 @@ public :
     }
 
     void begin() override {
+        _has_fresh_fix = false;
         claim();
         if (_pin_en != -1) {
             digitalWrite(_pin_en, GPS_EN_ACTIVE);
@@ -86,6 +89,7 @@ public :
     }
 
     void reset() override {
+        _has_fresh_fix = false;
         if (_pin_reset != -1) {
             digitalWrite(_pin_reset, GPS_RESET_ACTIVE);
             delay(10);
@@ -94,6 +98,7 @@ public :
     }
 
     void stop() override {
+        _has_fresh_fix = false;
         if (_pin_en != -1) {
             digitalWrite(_pin_en, !GPS_EN_ACTIVE);
         }
@@ -122,8 +127,9 @@ public :
         return alt;
     }
     long satellitesCount() override { return nmea.getNumSatellites(); }
-    long getHDOP() override { return nmea.getHDOP(); }
+    long getHDOP() override { return nmea.getHDOP() == 255 ? -1 : nmea.getHDOP(); }
     bool isValid() override { return nmea.isValid(); }
+    uint32_t getFixAgeMillis() override { return _has_fresh_fix ? millis() - _last_fix_ms : UINT32_MAX; }
 
     long getTimestamp() override { 
         DateTime dt(nmea.getYear(), nmea.getMonth(),nmea.getDay(),nmea.getHour(),nmea.getMinute(),nmea.getSecond());
@@ -141,7 +147,10 @@ public :
             #ifdef GPS_NMEA_DEBUG
             Serial.print(c);
             #endif
-            nmea.process(c);
+            if (nmea.process(c) && MicroNMEA::testChecksum(nmea.getSentence()) && nmea.isValid()
+                && (!strcmp(nmea.getMessageID(), "GGA") || !strcmp(nmea.getMessageID(), "RMC"))) {
+                _last_fix_ms = millis(); _has_fresh_fix = true;
+            }
         }
 
         if (!isValid()) time_valid = 0;

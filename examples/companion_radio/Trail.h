@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <math.h>
 #include <stdint.h>
+#include <limits.h>
+#include <string.h>
 #include <time.h>
 #include "Persist.h"
 #include "GeoUtils.h"
@@ -28,13 +30,18 @@ struct TrailPoint {
   int32_t  lon_1e6;
   uint32_t ts;            // epoch seconds (RTC)
   uint8_t  flags;         // bit 0 = SEG_START (don't draw a line from the previous point)
+  int16_t  altitude_m;    // filtered metres; INT16_MIN means unavailable (also on v1 trails)
 };
+static_assert(sizeof(TrailPoint) == 16, "Altitude must fit the existing trail point padding");
 
 static const uint8_t TRAIL_FLAG_SEG_START = 0x01;
 
 class TrailStore {
 public:
   static const int CAPACITY = 512;
+  static constexpr int16_t UNKNOWN_ALTITUDE = INT16_MIN;
+  static constexpr int32_t UNKNOWN_ALTITUDE_MM = INT32_MIN;
+  static const int CLIMB_THRESHOLD_M = 5;
   // _count is serialised as uint16_t in the save header — fail the build loudly
   // if CAPACITY is ever grown past what that can hold, rather than truncating.
   static_assert(CAPACITY <= 0xFFFF, "TrailStore::CAPACITY must fit in the uint16_t save-header count");
@@ -80,6 +87,7 @@ public:
 
   bool isActive() const { return _active; }
   void setActive(bool a) {
+    if (a != _active) resetElevationFilter();
     if (a && !_active) {
       // off → on: start a new session timer.
       _session_start_ms = millis();
@@ -106,6 +114,7 @@ public:
   bool isPaused() const { return _paused; }
   void setPaused(bool p) {
     if (!_active || p == _paused) return;
+    resetElevationFilter();
     if (p) {
       if (_session_start_ms != 0) {
         _accumulated_ms  += millis() - _session_start_ms;
@@ -134,6 +143,9 @@ public:
     _session_start_ms  = 0;
     _paused            = false;
     _has_pending       = false;
+    _ascent_m = _descent_m = 0;
+    _min_alt_m = _max_alt_m = UNKNOWN_ALTITUDE;
+    resetElevationFilter();
   }
 
   // Returns true if the sample was accepted (passed the min-delta gate) —
@@ -172,21 +184,25 @@ public:
   // commits more vertices per route (more fidelity, less reduction).
   static constexpr float CORRIDOR_FACTOR = 0.5f;
 
-  bool addPoint(int32_t lat_1e6, int32_t lon_1e6, uint32_t ts, uint16_t min_delta_m) {
+  bool addPoint(int32_t lat_1e6, int32_t lon_1e6, uint32_t ts, uint16_t min_delta_m,
+                int32_t altitude_mm = UNKNOWN_ALTITUDE_MM) {
+    int16_t altitude = filterAltitude(altitude_mm);
     const TrailPoint* ref = _has_pending ? &_pending : (_count > 0 ? &last() : nullptr);
     if (ref && !_pending_seg_break) {
       float d = haversineMeters(ref->lat_1e6, ref->lon_1e6, lat_1e6, lon_1e6);
       if (d < (float)min_delta_m) return false;
     }
+    // Count climbing only on accepted movement, not while GPS wanders in place.
+    recordElevation(altitude);
 
     if (_count == 0 || _pending_seg_break) {
       flushPending();   // shouldn't normally have one here, but never lose real distance
-      commitPoint(lat_1e6, lon_1e6, ts, TRAIL_FLAG_SEG_START);
+      commitPoint(lat_1e6, lon_1e6, ts, TRAIL_FLAG_SEG_START, altitude);
       _pending_seg_break = false;
       return true;
     }
 
-    TrailPoint sample{ lat_1e6, lon_1e6, ts, 0 };
+    TrailPoint sample{ lat_1e6, lon_1e6, ts, 0, altitude };
     if (!_has_pending) {
       _pending     = sample;   // last in-corridor sample (the commit candidate)
       _dir         = sample;   // fixes the corridor direction: last() → _dir
@@ -194,10 +210,11 @@ public:
       return true;
     }
 
-    if (crossTrackMeters(last(), _dir, sample) <= (float)min_delta_m * CORRIDOR_FACTOR) {
+    if (crossTrackMeters(last(), _dir, sample) <= (float)min_delta_m * CORRIDOR_FACTOR
+        && !elevationBend(last(), _dir, sample)) {
       _pending = sample;                                            // within corridor — extend
     } else {
-      commitPoint(_pending.lat_1e6, _pending.lon_1e6, _pending.ts, 0);  // left corridor — keep last good
+      commitPoint(_pending.lat_1e6, _pending.lon_1e6, _pending.ts, 0, _pending.altitude_m);
       _pending = sample;   // the exiting sample opens the next run...
       _dir     = sample;   // ...and fixes its corridor direction from the just-committed vertex
     }
@@ -232,11 +249,24 @@ public:
   }
 
   // Average speed in km/h = total distance / cumulative active time.
-  uint16_t avgSpeedKmh() const {
+  float avgSpeedKmh() const {
     uint32_t es = elapsedSeconds();
     if (es == 0) return 0;
-    return (uint16_t)((float)totalDistanceMeters() / (float)es * 3.6f);
+    return (float)totalDistanceMeters() / (float)es * 3.6f;
   }
+
+  int16_t currentAltitudeMeters() const {
+    return !_active && _count > 0 ? last().altitude_m : _current_alt_m;
+  }
+  int16_t minAltitudeMeters() const { return _min_alt_m; }
+  int16_t maxAltitudeMeters() const { return _max_alt_m; }
+  uint32_t ascentMeters() const { return _ascent_m; }
+  uint32_t descentMeters() const { return _descent_m; }
+  bool hasElevation() const { return _min_alt_m != UNKNOWN_ALTITUDE; }
+  // A missing/poor fix must not become a climb across the acquisition gap.
+  void breakElevationSampling() { resetElevationFilter(); }
+  int profileCount() const { return _count + (_has_pending ? 1 : 0); }
+  const TrailPoint& profileAt(int i) const { return i == _count ? _pending : at(i); }
 
   // Compute bounding box across all points. Returns false if empty.
   bool boundingBox(int32_t& min_lat, int32_t& min_lon,
@@ -256,10 +286,11 @@ public:
 
   // Persistent snapshot — single slot at the given filesystem path.
   // Layout: 4-byte magic "TRAL", uint8 version, uint8 reserved, uint16 count,
-  // uint32 accumulated_ms, then `count` raw TrailPoint records. count is
-  // clamped to CAPACITY on load.
+  // uint32 accumulated_ms, then v2 ascent/descent(uint32 each), min/max altitude
+  // (int16 each), followed by `count` 16-byte points. v1 has no elevation fields;
+  // its point padding is explicitly discarded when loading/exporting.
   static const uint32_t SAVE_MAGIC = 0x4C415254;  // "TRAL"
-  static const uint8_t  SAVE_VERSION = 1;
+  static const uint8_t  SAVE_VERSION = 2;
 
   // Caller supplies an opened, writable File (the FS-open call is
   // platform-specific). Returns true if the header and every point wrote
@@ -270,6 +301,10 @@ public:
     if (!persist::writeHeader(file, SAVE_MAGIC, SAVE_VERSION, (uint16_t)_count)) return false;
     uint32_t accum = currentAccumulatedMs();
     if (file.write((uint8_t*)&accum, sizeof(accum)) != sizeof(accum)) return false;
+    if (file.write((uint8_t*)&_ascent_m, sizeof(_ascent_m)) != sizeof(_ascent_m)
+        || file.write((uint8_t*)&_descent_m, sizeof(_descent_m)) != sizeof(_descent_m)
+        || file.write((uint8_t*)&_min_alt_m, sizeof(_min_alt_m)) != sizeof(_min_alt_m)
+        || file.write((uint8_t*)&_max_alt_m, sizeof(_max_alt_m)) != sizeof(_max_alt_m)) return false;
     for (int i = 0; i < _count; i++) {
       if (file.write((uint8_t*)&at(i), sizeof(TrailPoint)) != sizeof(TrailPoint)) return false;
     }
@@ -280,9 +315,9 @@ public:
   bool readFrom(F& file) {
     uint16_t cnt = 0;
     uint32_t accum = 0;
-    if (!persist::readHeader(file, SAVE_MAGIC, SAVE_VERSION, cnt)) return false;
-    if (file.read((uint8_t*)&accum, sizeof(accum)) != (int)sizeof(accum)) return false;
-    if (cnt > CAPACITY) return false;
+    uint8_t version = 0;
+    ElevationStats stats{};
+    if (!readSnapshotHeader(file, version, cnt, accum, stats)) return false;
     if (_active) {
       _active = false;
       _session_start_ms = 0;
@@ -291,12 +326,17 @@ public:
     _has_pending = false;   // any candidate belonged to the session being replaced
     _head = 0;
     _count = 0;
+    resetElevationFilter();
     for (int i = 0; i < cnt; i++) {
-      TrailPoint p;
-      int n = file.read((uint8_t*)&p, sizeof(TrailPoint));
-      if (n != (int)sizeof(TrailPoint)) break;
+      TrailPoint p{};
+      if (!readSnapshotPoint(file, version, p)) { clear(); return false; }
       _buf[_count++] = p;
     }
+    _ascent_m = stats.ascent;
+    _descent_m = stats.descent;
+    _min_alt_m = stats.minimum;
+    _max_alt_m = stats.maximum;
+    if (_count > 0) _current_alt_m = last().altitude_m;
     _accumulated_ms = accum;
     _pending_seg_break = true;
     return true;
@@ -384,13 +424,17 @@ public:
       n += out.print(F("<trkseg>\n"));
       in_segment = true;
     }
-    char buf[120];
+    char buf[152];
     time_t t = (time_t)p.ts;
     struct tm* gt = ::gmtime(&t);
     if (!gt) return n;  // defensive: skip malformed timestamps
+    char elevation[24] = "";
+    if (p.altitude_m != UNKNOWN_ALTITUDE)
+      snprintf(elevation, sizeof(elevation), "<ele>%d</ele>", (int)p.altitude_m);
     int len = snprintf(buf, sizeof(buf),
-      "<trkpt lat=\"%.6f\" lon=\"%.6f\"><time>%04d-%02d-%02dT%02d:%02d:%02dZ</time></trkpt>\n",
+      "<trkpt lat=\"%.6f\" lon=\"%.6f\">%s<time>%04d-%02d-%02dT%02d:%02d:%02dZ</time></trkpt>\n",
       p.lat_1e6 / 1.0e6, p.lon_1e6 / 1.0e6,
+      elevation,
       gt->tm_year + 1900, gt->tm_mon + 1, gt->tm_mday,
       gt->tm_hour, gt->tm_min, gt->tm_sec);
     if (len < 0) return n;
@@ -409,6 +453,7 @@ public:
     for (int i = 0; i < _count; i++) {
       total += gpxPoint(out, at(i), i == 0, in_segment);
     }
+    if (_has_pending) total += gpxPoint(out, _pending, _count == 0, in_segment);
     total += gpxFooter(out, in_segment);
     return total;
   }
@@ -419,18 +464,17 @@ public:
   static size_t exportGpxFromFile(F& file, S& out, WP& wpts, const char* trk_name = "MeshCore Trail") {
     uint16_t cnt = 0;
     uint32_t accum = 0;
-    if (!persist::readHeader(file, SAVE_MAGIC, SAVE_VERSION, cnt)) return 0;
-    if (file.read((uint8_t*)&accum, sizeof(accum)) != (int)sizeof(accum)) return 0;
-    if (cnt > CAPACITY) return 0;
+    uint8_t version = 0;
+    ElevationStats stats{};
+    if (!readSnapshotHeader(file, version, cnt, accum, stats)) return 0;
 
     size_t total = gpxHeader(out);
     total += gpxWaypoints(out, wpts);
     total += gpxTrackOpen(out, trk_name);
     bool in_segment = false;
     for (uint16_t i = 0; i < cnt; i++) {
-      TrailPoint p;
-      int n = file.read((uint8_t*)&p, sizeof(TrailPoint));
-      if (n != (int)sizeof(TrailPoint)) break;
+      TrailPoint p{};
+      if (!readSnapshotPoint(file, version, p)) return 0;
       total += gpxPoint(out, p, i == 0, in_segment);
     }
     total += gpxFooter(out, in_segment);
@@ -467,7 +511,105 @@ private:
   TrailPoint _pending;
   TrailPoint _dir;
 
-  void commitPoint(int32_t lat_1e6, int32_t lon_1e6, uint32_t ts, uint8_t flags) {
+  struct ElevationStats {
+    uint32_t ascent = 0, descent = 0;
+    int16_t minimum = UNKNOWN_ALTITUDE, maximum = UNKNOWN_ALTITUDE;
+  };
+  uint32_t _ascent_m = 0, _descent_m = 0;
+  int16_t _min_alt_m = UNKNOWN_ALTITUDE, _max_alt_m = UNKNOWN_ALTITUDE;
+  int16_t _current_alt_m = UNKNOWN_ALTITUDE, _elevation_anchor_m = UNKNOWN_ALTITUDE;
+  int32_t _alt_window[5]{};
+  uint8_t _alt_count = 0, _alt_next = 0;
+  float _filtered_alt_m = 0;
+  uint32_t _last_alt_sample_ms = 0;
+
+  void resetElevationFilter() {
+    _alt_count = _alt_next = 0;
+    _current_alt_m = _elevation_anchor_m = UNKNOWN_ALTITUDE;
+  }
+
+  int16_t filterAltitude(int32_t mm) {
+    uint32_t now = millis();
+    if (mm == UNKNOWN_ALTITUDE_MM || mm < -32767000 || mm > 32767000) {
+      resetElevationFilter();
+      return UNKNOWN_ALTITUDE;
+    }
+    if (_alt_count && (uint32_t)(now - _last_alt_sample_ms) > 10000) resetElevationFilter();
+    _last_alt_sample_ms = now;
+    _alt_window[_alt_next] = mm;
+    _alt_next = (_alt_next + 1) % 5;
+    if (_alt_count < 5) ++_alt_count;
+    if (_alt_count < 5) return UNKNOWN_ALTITUDE;
+    // Median rejects isolated spikes; EMA smooths the remaining vertical jitter.
+    int32_t sorted[5];
+    memcpy(sorted, _alt_window, sizeof(sorted));
+    for (int i = 1; i < 5; ++i) {
+      int32_t value = sorted[i]; int j = i;
+      while (j > 0 && sorted[j - 1] > value) { sorted[j] = sorted[j - 1]; --j; }
+      sorted[j] = value;
+    }
+    float median = sorted[2] / 1000.0f;
+    if (_current_alt_m == UNKNOWN_ALTITUDE) _filtered_alt_m = median;
+    else _filtered_alt_m += (median - _filtered_alt_m) * 0.25f;
+    _current_alt_m = (int16_t)lroundf(_filtered_alt_m);
+    return _current_alt_m;
+  }
+
+  void recordElevation(int16_t altitude) {
+    if (altitude == UNKNOWN_ALTITUDE) { _elevation_anchor_m = UNKNOWN_ALTITUDE; return; }
+    if (_min_alt_m == UNKNOWN_ALTITUDE || altitude < _min_alt_m) _min_alt_m = altitude;
+    if (_max_alt_m == UNKNOWN_ALTITUDE || altitude > _max_alt_m) _max_alt_m = altitude;
+    if (_elevation_anchor_m != UNKNOWN_ALTITUDE) {
+      int delta = (int)altitude - _elevation_anchor_m;
+      if (abs(delta) < CLIMB_THRESHOLD_M) return;
+      if (delta > 0) _ascent_m += delta;
+      else _descent_m += -delta;
+    }
+    _elevation_anchor_m = altitude;
+  }
+
+  // Preserve crests/valleys even when a route is horizontally straight.
+  static bool elevationBend(const TrailPoint& a, const TrailPoint& b, const TrailPoint& c) {
+    if (a.altitude_m == UNKNOWN_ALTITUDE || b.altitude_m == UNKNOWN_ALTITUDE
+        || c.altitude_m == UNKNOWN_ALTITUDE)
+      return (a.altitude_m == UNKNOWN_ALTITUDE) != (b.altitude_m == UNKNOWN_ALTITUDE)
+          || (b.altitude_m == UNKNOWN_ALTITUDE) != (c.altitude_m == UNKNOWN_ALTITUDE);
+    float ab = haversineMeters(a.lat_1e6, a.lon_1e6, b.lat_1e6, b.lon_1e6);
+    float ac = haversineMeters(a.lat_1e6, a.lon_1e6, c.lat_1e6, c.lon_1e6);
+    if (ab < 0.01f) return false;
+    // Fix the grade at the start of the run, like the horizontal corridor.
+    // Re-aiming at each new endpoint would erase a gradual crest/valley.
+    float expected = a.altitude_m + (b.altitude_m - a.altitude_m) * ac / ab;
+    return fabsf(c.altitude_m - expected) >= 3.0f;
+  }
+
+  template <typename F>
+  static bool readSnapshotHeader(F& file, uint8_t& version, uint16_t& count,
+                                 uint32_t& accumulated, ElevationStats& stats) {
+    uint32_t magic = 0;
+    uint8_t reserved = 0;
+    if (file.read((uint8_t*)&magic, 4) != 4 || magic != SAVE_MAGIC
+        || file.read(&version, 1) != 1 || (version != 1 && version != SAVE_VERSION)
+        || file.read(&reserved, 1) != 1 || file.read((uint8_t*)&count, 2) != 2
+        || count > CAPACITY || file.read((uint8_t*)&accumulated, 4) != 4) return false;
+    if (version == 1) return true;
+    return file.read((uint8_t*)&stats.ascent, 4) == 4
+        && file.read((uint8_t*)&stats.descent, 4) == 4
+        && file.read((uint8_t*)&stats.minimum, 2) == 2
+        && file.read((uint8_t*)&stats.maximum, 2) == 2
+        && ((stats.minimum == UNKNOWN_ALTITUDE && stats.maximum == UNKNOWN_ALTITUDE)
+            || (stats.minimum != UNKNOWN_ALTITUDE && stats.maximum != UNKNOWN_ALTITUDE
+                && stats.minimum <= stats.maximum));
+  }
+
+  template <typename F>
+  static bool readSnapshotPoint(F& file, uint8_t version, TrailPoint& point) {
+    if (file.read((uint8_t*)&point, sizeof(point)) != (int)sizeof(point)) return false;
+    if (version == 1) point.altitude_m = UNKNOWN_ALTITUDE;
+    return true;
+  }
+
+  void commitPoint(int32_t lat_1e6, int32_t lon_1e6, uint32_t ts, uint8_t flags, int16_t altitude) {
     int pos;
     if (_count < CAPACITY) {
       pos = (_head + _count) % CAPACITY;
@@ -480,6 +622,7 @@ private:
     _buf[pos].lon_1e6 = lon_1e6;
     _buf[pos].ts      = ts;
     _buf[pos].flags   = flags;
+    _buf[pos].altitude_m = altitude;
   }
 
   // Commit the pending candidate (if any) as a real vertex. Called before a
@@ -487,7 +630,7 @@ private:
   // never silently dropped just because no bend came along to force a commit.
   void flushPending() {
     if (!_has_pending) return;
-    commitPoint(_pending.lat_1e6, _pending.lon_1e6, _pending.ts, 0);
+    commitPoint(_pending.lat_1e6, _pending.lon_1e6, _pending.ts, 0, _pending.altitude_m);
     _has_pending = false;
   }
 

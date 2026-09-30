@@ -21,6 +21,7 @@ public:
     // satellitesCount() in that case.
     virtual long getHDOP() { return -1; }
     virtual bool isValid() = 0;
+    virtual uint32_t getFixAgeMillis() { return UINT32_MAX; }
     virtual long getTimestamp() = 0;
     // Default no-op body (every existing subclass overrides this anyway --
     // MicroNMEALocationProvider.h forwards to the NMEA lib,

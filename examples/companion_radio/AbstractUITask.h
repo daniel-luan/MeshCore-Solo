@@ -24,7 +24,7 @@ enum class UIEventType {
     ack
 };
 
-enum class StorageActivity : uint8_t { Contacts, Advert, Settings };
+enum class StorageActivity : uint8_t { Contacts, Advert, Settings, RouteImport, RouteVerify };
 
 class AbstractUITask {
 protected:

@@ -24,6 +24,9 @@ public:
     CONTACTS_REPLACE,
     USB_WRITE,
     OLED_FLUSH,
+    ROUTE_IO,
+    ROUTE_VERIFY,
+    ROUTE_SEARCH,
     METRIC_COUNT
   };
 

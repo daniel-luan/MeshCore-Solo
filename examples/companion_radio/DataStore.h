@@ -83,6 +83,8 @@ public:
   File openRead(const char* filename);
   File openRead(FILESYSTEM* fs, const char* filename);
   File openWrite(const char* filename);
+  File openWrite(FILESYSTEM* fs, const char* filename);
+  bool getStorageBytes(FILESYSTEM* fs, uint32_t& total, uint32_t& used, uint32_t& block) const;
   // Replace final_path with a fully-written temp file (see openWrite()).
   // On filesystems whose rename cannot overwrite, this removes the old path
   // first; use A/B snapshots for records that must survive that window.

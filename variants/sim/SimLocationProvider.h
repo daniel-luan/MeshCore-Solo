@@ -25,6 +25,7 @@
 class SimLocationProvider : public LocationProvider {
   long _lat_e6 = 0, _lon_e6 = 0, _alt_mm = 0;
   bool _valid = false;
+  uint32_t _last_fix_ms = 0;
 
 public:
   long getLatitude() override { return _lat_e6; }
@@ -32,6 +33,7 @@ public:
   long getAltitude() override { return _alt_mm; }
   long satellitesCount() override { return _valid ? 8 : 0; }
   bool isValid() override { return _valid; }
+  uint32_t getFixAgeMillis() override { return _valid ? millis() - _last_fix_ms : UINT32_MAX; }
   long getTimestamp() override { return _valid ? (long)time(NULL) : 0; }
   void reset() override { _valid = false; }
   void begin() override { }
@@ -45,6 +47,7 @@ public:
     _lon_e6 = (long)(lon_deg * 1000000.0f);
     _alt_mm = (long)(alt_m * 1000.0f);
     _valid = true;
+    _last_fix_ms = millis();
   }
 };
 

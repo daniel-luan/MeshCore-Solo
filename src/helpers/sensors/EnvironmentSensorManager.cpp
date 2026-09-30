@@ -181,12 +181,15 @@ class RAK12500LocationProvider : public LocationProvider {
   int _sats = 0;
   long _epoch = 0;
   bool _fix = false;
+  uint32_t _last_route_fix_ms = 0;
+  long _last_route_epoch = 0;
 public:
   long getLatitude() override { return _lat; }
   long getLongitude() override { return _lng; }
   long getAltitude() override { return _alt; }
   long satellitesCount() override { return _sats; }
   bool isValid() override { return _fix; }
+  uint32_t getFixAgeMillis() override { return _last_route_epoch ? millis() - _last_route_fix_ms : UINT32_MAX; }
   long getTimestamp() override { return _epoch; }
   void sendSentence(const char * sentence) override { }
   void reset() override { }
@@ -203,6 +206,7 @@ public:
       _fix = false;
     }
     _epoch = ublox_GNSS.getUnixEpoch(2);
+    if (_fix && _epoch != _last_route_epoch) { _last_route_epoch = _epoch; _last_route_fix_ms = millis(); }
   }
   bool isEnabled() override { return true; }
 };

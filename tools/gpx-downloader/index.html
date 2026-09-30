@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MeshCore GPX Downloader</title>
+  <title>MeshCore GPX Route Tools</title>
   <style>
     :root {
       --bg:     #12121e;
@@ -198,6 +198,7 @@ $id('connectBtn').addEventListener('click', async () => {
   }
 });
 
+window.disconnectGpxExport = doDisconnect;
 async function doDisconnect() {
   if (reader) { try { await reader.cancel(); } catch {} reader = null; }
   if (port)   { try { await port.close();    } catch {} port   = null; }
@@ -302,5 +303,6 @@ function showError(msg) {
   $id('progressBox').textContent = msg;
 }
 </script>
+<script type="module" src="routes/importer.mjs"></script>
 </body>
 </html>

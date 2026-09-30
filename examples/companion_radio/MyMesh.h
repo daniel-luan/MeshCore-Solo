@@ -1,5 +1,10 @@
 #pragma once
 
+#if defined(FIRMWARE_SOLO_BUILD)
+#include "RouteFilesystem.h"
+#include "RouteStore.h"
+#endif
+
 #include <Arduino.h>
 #include <Mesh.h>
 #include "AbstractUITask.h"
@@ -357,6 +362,16 @@ public:
 #endif
     return saved;
   }
+#if defined(FIRMWARE_SOLO_BUILD)
+  routes::RouteStore& routeStore() { return _route_store; }
+  bool saveRouteSettings(uint32_t metres, uint32_t seconds) {
+    if (_ui) _ui->showStorageBusyNow(StorageActivity::Settings);
+    bool ok = _route_files.saveSettings(metres, seconds);
+    if (ok) _route_store.settings(metres, seconds);
+    if (_ui) _ui->setStorageBusy(false);
+    return ok;
+  }
+#endif
   void saveRTCTime() { _store->saveRTCTime(); }
   // Contact updates (new adverts, path/lastmod changes) are lazily debounced
   // (see dirty_contacts_expiry) to avoid wearing flash on every packet --
@@ -598,6 +613,10 @@ private:
   uint8_t *sign_data;
   uint32_t sign_data_len;
   unsigned long dirty_contacts_expiry;
+#if defined(FIRMWARE_SOLO_BUILD)
+  RouteFilesystem _route_files;
+  routes::RouteStore _route_store;
+#endif
   unsigned long _bot_last_ch_reply_ms;
   unsigned long _bot_last_room_reply_ms;
   unsigned long _next_auto_advert_ms;

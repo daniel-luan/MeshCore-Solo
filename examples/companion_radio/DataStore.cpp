@@ -287,6 +287,38 @@ File DataStore::openWrite(const char* filename) {
   return ::openWrite(_fs, filename);
 }
 
+File DataStore::openWrite(FILESYSTEM* fs, const char* filename) { return ::openWrite(fs, filename); }
+
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+struct RouteBlockCount { uint32_t used, limit; };
+static int countRouteBlock(void* context, lfs_block_t block) {
+  RouteBlockCount* count = (RouteBlockCount*)context;
+  if (block >= count->limit || count->used == UINT32_MAX) return LFS_ERR_CORRUPT;
+  ++count->used;
+  return 0;
+}
+#endif
+bool DataStore::getStorageBytes(FILESYSTEM* fs, uint32_t& total, uint32_t& used, uint32_t& block) const {
+#if defined(ESP32)
+  total = SPIFFS.totalBytes(); used = SPIFFS.usedBytes(); block = 4096;
+#elif defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  const lfs_config* config = fs->_getFS()->cfg;
+  if (!config || !config->block_size || !config->block_count) return false;
+  RouteBlockCount count{0, config->block_count};
+  if (lfs_traverse(fs->_getFS(), countRouteBlock, &count) < 0) return false;
+  uint64_t capacity = (uint64_t)config->block_size * config->block_count;
+  uint64_t allocated = (uint64_t)config->block_size * count.used;
+  if (capacity > UINT32_MAX || allocated > capacity) return false;
+  total = capacity; used = allocated; block = config->block_size;
+#elif defined(RP2040_PLATFORM)
+  FSInfo info; if (!fs->info(info)) return false;
+  total=info.totalBytes; used=info.usedBytes; block=info.blockSize;
+#else
+  return false;
+#endif
+  return total > 0 && used <= total;
+}
+
 bool DataStore::commitFile(const char* tmp_path, const char* final_path) {
   return commitTempFile(_fs, tmp_path, final_path);
 }

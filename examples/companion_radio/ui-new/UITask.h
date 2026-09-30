@@ -111,6 +111,9 @@ class UITask : public AbstractUITask {
   UIScreen* live_share_screen = nullptr;
   UIScreen* locator_screen = nullptr;
   UIScreen* trail_screen = nullptr;
+#ifdef FIRMWARE_SOLO_BUILD
+  UIScreen* routes_screen = nullptr;
+#endif
   UIScreen* compass_screen = nullptr;
   UIScreen* diag_screen = nullptr;
   UIScreen* repeater_screen = nullptr;
@@ -393,6 +396,9 @@ public:
   // on the map. Used by locatorDistance() and the map renderers.
   bool activeTargetPos(int32_t& lat, int32_t& lon) const;
   void gotoTrailScreen();
+#ifdef FIRMWARE_SOLO_BUILD
+  void gotoRoutesScreen();
+#endif
   void gotoMapScreen();   // opens the Trail screen directly in its Map view
   void gotoCompassScreen();
   void gotoDiagnosticsScreen();

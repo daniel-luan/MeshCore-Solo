@@ -38,7 +38,7 @@ class DiagnosticsScreen : public UIScreen {
   static const char* const TAB_LABELS[TAB_COUNT];
 
   struct Row { const char* label; char value[20]; };
-  static const int MAX_ROWS = 20;
+  static const int MAX_ROWS = 24;
   Row _rows[MAX_ROWS];
   int _row_count = 0;
 
@@ -181,6 +181,9 @@ class DiagnosticsScreen : public UIScreen {
     addTimingRow("C close",  DeviceTiming::CONTACTS_CLOSE);
     addTimingRow("C swap",   DeviceTiming::CONTACTS_REPLACE);
     addTimingRow("USB",      DeviceTiming::USB_WRITE);
+    addTimingRow("Route I/O", DeviceTiming::ROUTE_IO);
+    addTimingRow("Route check", DeviceTiming::ROUTE_VERIFY);
+    addTimingRow("Route nav", DeviceTiming::ROUTE_SEARCH);
     addTimingRow("OLED",     DeviceTiming::OLED_FLUSH);
   }
 

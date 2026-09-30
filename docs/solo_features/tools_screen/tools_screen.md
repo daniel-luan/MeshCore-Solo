@@ -93,9 +93,14 @@ Cycle views with **LEFT / RIGHT**:
 
 | View        | Content                                                                                                                                                             |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Summary** | Distance, elapsed time, avg speed or pace, point count, tracking status                                                                                             |
+| **Summary** | Distance, active tracking time, average speed (one decimal) or pace, point count, tracking status, latest altitude, total ascent/descent, and minimum/maximum altitude. Scroll with **UP/DOWN**. |
 | **Map**     | Auto-fit dot-and-line plot with cos(lat) aspect correction; segment breaks marked; north arrow; square scale grid fitted to the map frame (toggle under **Hold Enter → Settings → Grid**, Map view only). Your **current GPS position**, all **waypoints**, and any **live-tracked contacts** (positions shared via Live Share) are always drawn — even with no trail recording — so the map is useful standalone. The active **Locator/Nav target**, if set, is drawn as a **flag** on top (folded into the frame so it's never off-screen). Point labels are auto-placed to avoid overlapping (a crowded cluster drops some labels rather than smearing them) |
+| **Elevation** | Altitude plotted against distance along the retained trail, including the latest pending point. Height uses metres or feet; the horizontal axis uses the global distance units. Missing elevation and stopped/paused segments break the line. |
 | **List**    | Per-point rows showing local time (HH:MM) and delta distance from the previous point; segment-start rows show `start`; scroll with **UP/DOWN**                      |
+
+Elevation comes from GPS. Elevation recording requires HDOP at or below 3.0, or at least four satellites when the provider does not report HDOP; position recording continues even when height quality is poor. A five-sample median rejects isolated spikes, followed by exponential smoothing. Climb totals count accepted movement with a five-metre change threshold, avoiding accumulation while stationary. Height acquisition restarts after a poor/missing fix or pause, so a height difference across that gap is not counted as climbing. These are estimates, not barometric measurements.
+
+Saved trails and GPX exports now include metre-resolution elevation; saved snapshots also retain climb totals and altitude extremes. Older saved trails still load and export, with unavailable elevation displayed as `--`. The profile covers retained points, while climb totals cover the recorded session, including points that have rolled out of the buffer. Altitude uses existing point padding, keeping the 512-point buffer at 8 KB. Reverting to older firmware requires a version 1 trail snapshot; older firmware cannot read new version 2 snapshots.
 
 |           OLED            |           E-Ink           |
 | :-----------------------: | :-----------------------: |
@@ -588,3 +593,7 @@ Send commands to a **repeater/room server you have admin permission on** — the
 ### This device
 
 Admin doesn't manage the companion itself — its own settings live in **Settings**: **Radio** (preset / freq / SF / BW / CR) and **TX power** in the Radio section, and **Name** and **Reboot** in the System section. **Send advert** is the home **ADVERT** page.
+
+## Planned routes
+
+Import GPX over USB and follow a planned route with checkpoints, elevation, forward/reverse traversal, and off-route alerts. See [Planned routes](routes.md).

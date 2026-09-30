@@ -266,6 +266,7 @@ int RadioLibWrapper::recvRaw(uint8_t* bytes, int sz) {
       } else {
       //  Serial.print("  readData() -> "); Serial.println(len);
         n_recv++;
+        _last_recv_ms = millis();
       }
     }
     #if defined(USE_LR2021)

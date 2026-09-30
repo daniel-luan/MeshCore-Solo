@@ -174,6 +174,9 @@ static const int QUICK_MSGS_MAX = 10;
 #include "LiveShareScreen.h"
 #include "LocatorScreen.h"
 #include "TrailScreen.h"
+#ifdef FIRMWARE_SOLO_BUILD
+#include "RoutesScreen.h"
+#endif
 #include "CompassScreen.h"
 #include "DiagnosticsScreen.h"
 #include "RepeaterScreen.h"
@@ -465,6 +468,20 @@ class HomeScreen : public UIScreen {
   // own clock (see the LOCK branch in render(), which passes its actual
   // footprint here so the icon row sheds low-priority icons instead of
   // drawing over the clock). -1 = use the normal name reserve.
+  int drawBatteryIcon(DisplayDriver& display, int pct, int y) {
+    const int lh = display.getLineHeight();
+    const int iconH = display.isSingleFont() ? lh - 2 : lh;
+    const int iconW = lh * 2;
+    const int bm = display.isLandscape() ? 3 : 2;
+    const int left = display.width() - iconW - 3;
+    display.drawRect(left, y, iconW, iconH);
+    const int nub_h = iconH / 2;
+    display.fillRect(left + iconW, y + (iconH - nub_h) / 2, 2, nub_h);
+    int fillW = (pct * (iconW - 2 * bm)) / 100;
+    display.fillRect(left + bm, y + bm, fillW, iconH - 2 * bm);
+    return left;
+  }
+
   int renderBatteryIndicator(DisplayDriver& display, uint16_t batteryMilliVolts, int reserve_left = -1) {
     int low_mv = _node_prefs ? (int)_node_prefs->low_batt_mv : 0;
     int pct = battMvToPercent((int)batteryMilliVolts, low_mv);
@@ -494,20 +511,8 @@ class HomeScreen : public UIScreen {
       battLeftX = display.width() - display.getTextWidth(buf) - 1;
       display.setCursor(battLeftX, 0);
       display.print(buf);
-    } else {  // icon — scales with lh, same box height as the status icons beside it (ind_h)
-      const int iconH = ind_h;
-      const int iconW = lh * 2;
-      const int bm = display.isLandscape() ? 3 : 2;  // inner margin: 3px on landscape e-ink, 2px on OLED/portrait
-      battLeftX = display.width() - iconW - 3;
-      display.drawRect(battLeftX, 0, iconW, iconH);
-      // Nub height/2, vertically centred by remaining-space/2 rather than a flat
-      // iconH/4 margin — the flat form only centres when iconH is a multiple of
-      // 4 (true for the old built-in font's lh=8, false for misc-fixed's 7/9),
-      // so it visibly drifted off-centre once the box height changed.
-      const int nub_h = iconH / 2;
-      display.fillRect(battLeftX + iconW, (iconH - nub_h) / 2, 2, nub_h);
-      int fillW = (pct * (iconW - 2 * bm)) / 100;
-      display.fillRect(battLeftX + bm, bm, fillW, iconH - 2 * bm);
+    } else {  // icon — scales with lh, same box height as the status icons beside it
+      battLeftX = drawBatteryIcon(display, pct, 0);
     }
 
     // Secondary status icons, laid out right→left in PRIORITY order so a crowded
@@ -888,17 +893,32 @@ public:
           _node_prefs->dashboard_fields[1] == DASH_NONE &&
           _node_prefs->dashboard_fields[2] == DASH_NONE;
         if (default_overview) {
-          char unread[32], batt[20], contacts[16];
+          char unread[32], batt[20];
           formatUnreadOverview(unread, sizeof(unread), _task, display);
           uint16_t mv = _task->getBattMilliVolts();
-          if (mv) snprintf(batt, sizeof(batt), "%u.%02uV", mv / 1000, (mv % 1000) / 10);
-          else strcpy(batt, "--");
-          snprintf(contacts, sizeof(contacts), "%d", the_mesh.getNumContacts());
           display.drawTextEllipsized(0, dash0, display.width(), unread);
           display.setCursor(0, dash0 + step); display.print("Batt");
-          display.drawTextRightAlign(display.width() - 1, dash0 + step, batt);
-          display.setCursor(0, dash0 + step * 2); display.print("Contacts");
-          display.drawTextRightAlign(display.width() - 1, dash0 + step * 2, contacts);
+          uint8_t batt_mode = _node_prefs->batt_display_mode < 3 ? _node_prefs->batt_display_mode : 0;
+          if (batt_mode == 0) {
+            drawBatteryIcon(display, battMvToPercent(mv, _node_prefs->low_batt_mv), dash0 + step);
+          } else {
+            if (!mv) strcpy(batt, "--");
+            else if (batt_mode == 1) snprintf(batt, sizeof(batt), "%d%%", battMvToPercent(mv, _node_prefs->low_batt_mv));
+            else snprintf(batt, sizeof(batt), "%u.%02uV", mv / 1000, (mv % 1000) / 10);
+            display.drawTextRightAlign(display.width() - 1, dash0 + step, batt);
+          }
+          char activity[20];
+          if (radio_driver.getPacketsRecv() == 0) {
+            strcpy(activity, "Never");
+          } else {
+            uint32_t age_s = (millis() - radio_driver.getLastRecvMillis()) / 1000;
+            if (age_s < 60) strcpy(activity, "<1m ago");
+            else if (age_s < 3600) snprintf(activity, sizeof(activity), "%lum ago", (unsigned long)(age_s / 60));
+            else if (age_s < 86400) snprintf(activity, sizeof(activity), "%luh ago", (unsigned long)(age_s / 3600));
+            else snprintf(activity, sizeof(activity), "%lud ago", (unsigned long)(age_s / 86400));
+          }
+          display.setCursor(0, dash0 + step * 2); display.print("Last RX");
+          display.drawTextRightAlign(display.width() - 1, dash0 + step * 2, activity);
         }
 
         // dashboard data fields
@@ -1461,7 +1481,11 @@ public:
     }
     if (_page == HomePage::CLOCK) {
       bool show_sec = !_node_prefs || !_node_prefs->clock_hide_seconds;
-      int ret = need_blink ? 1000 : (show_sec ? 1000 : 60000);
+      bool default_overview = _node_prefs &&
+        _node_prefs->dashboard_fields[0] == DASH_NONE &&
+        _node_prefs->dashboard_fields[1] == DASH_NONE &&
+        _node_prefs->dashboard_fields[2] == DASH_NONE;
+      int ret = show_sec ? 1000 : (default_overview ? 10000 : 60000);
       return (mq_delay > 0 && mq_delay < ret) ? mq_delay : ret;
     }
     int ret = need_blink ? 1000 : 5000;
@@ -1726,6 +1750,9 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   live_share_screen = new LiveShareScreen(this, node_prefs);
   locator_screen  = new LocatorScreen(this, node_prefs);
   trail_screen       = new TrailScreen(this, &_trail);
+#ifdef FIRMWARE_SOLO_BUILD
+  routes_screen      = new RoutesScreen(this);
+#endif
   compass_screen     = new CompassScreen(this);
   diag_screen        = new DiagnosticsScreen(this);
   repeater_screen    = new RepeaterScreen(this);
@@ -1756,6 +1783,9 @@ void UITask::openAdminFor(const ContactInfo& ci, bool from_picker) {
   ((AdminScreen*)admin_screen)->startFor(ci, from_picker);
 }
 void UITask::gotoDashboardConfig() { setCurrScreen(dashboard_config); }
+#ifdef FIRMWARE_SOLO_BUILD
+void UITask::gotoRoutesScreen() { setCurrScreen(routes_screen); }
+#endif
 void UITask::gotoTrailScreen()     { setCurrScreen(trail_screen); }
 void UITask::gotoCompassScreen()   { setCurrScreen(compass_screen); }
 void UITask::gotoDiagnosticsScreen() { setCurrScreen(diag_screen); }
@@ -2297,6 +2327,16 @@ void UITask::renderStorageOverlay() {
     title = "Saving settings";
     detail = "Writing preferences";
   }
+#ifdef FIRMWARE_SOLO_BUILD
+  char route_progress[40];
+  if (_storage_activity == StorageActivity::RouteImport || _storage_activity == StorageActivity::RouteVerify) {
+    auto& route = the_mesh.routeStore();
+    title = _storage_activity == StorageActivity::RouteImport ? "Importing route" : "Checking route";
+    if (route.state() == routes::RECEIVING) snprintf(route_progress, sizeof(route_progress), "%lu / %lu bytes", (unsigned long)route.received(), (unsigned long)route.transferBytes());
+    else snprintf(route_progress, sizeof(route_progress), "Verifying: %lu%%", (unsigned long)route.verifyProgress());
+    detail = route_progress;
+  }
+#endif
   const char* pause = "Input may pause";
   int w = _display->getTextWidth(title);
   if (_display->getTextWidth(detail) > w) w = _display->getTextWidth(detail);
@@ -3166,6 +3206,9 @@ void UITask::loop() {
   if (_sensors) {
     bool gps_needed_live =
         (_trail.isActive() && !_trail.isPaused())
+#ifdef FIRMWARE_SOLO_BUILD
+        || the_mesh.routeStore().following()
+#endif
         || (_node_prefs && _node_prefs->loc_share_enabled)
         || (_node_prefs && _node_prefs->locator_enabled && _node_prefs->locator_has_target)
         || curr == compass_screen
@@ -3179,6 +3222,26 @@ void UITask::loop() {
     // crossing state so that doesn't read as a spurious geofence crossing.
     if (_sensors->consumeGpsWakeEvent()) resetLocator();
   }
+
+#ifdef FIRMWARE_SOLO_BUILD
+  {
+    auto& route = the_mesh.routeStore();
+    LocationProvider* loc = _sensors ? _sensors->getLocationProvider() : nullptr;
+    bool valid = loc && loc->isValid() && loc->getFixAgeMillis() <= 5000;
+    long hdop = loc ? loc->getHDOP() : -1;
+    bool quality = loc && (hdop >= 0 ? (hdop > 0 && hdop <= 30) : loc->satellitesCount() >= 4);
+    route.fix(valid, quality, valid ? loc->getLatitude() : 0, valid ? loc->getLongitude() : 0, millis());
+    { ScopedDeviceTiming timing(DeviceTiming::ROUTE_SEARCH); route.navigationStep(millis()); }
+    if (route.takeAlert()) {
+      if (!_node_prefs || !_node_prefs->msg_wake_screen_off) checkDisplayOn(0);
+      notify(UIEventType::ack);
+      showAlert("Off planned route", 5000);
+    }
+    if (route.working()) setStorageBusy(true, route.state() == routes::RECEIVING ? StorageActivity::RouteImport : StorageActivity::RouteVerify);
+    else if (_storage_activity == StorageActivity::RouteImport || _storage_activity == StorageActivity::RouteVerify) setStorageBusy(false);
+  }
+
+#endif
 
   // GPS trail sampling — runs in the background while the trail is
   // active, independent of which screen is shown. Skips silently if no GPS
@@ -3214,8 +3277,16 @@ void UITask::loop() {
       } else if (_trail.isPaused()) {
         _trail.setPaused(false);   // feature turned off → resume
       }
-      if (!_trail.isPaused())
-        _trail.addPoint(la, lo, (uint32_t)rtc_clock.getCurrentTime(), md);
+      if (!_trail.isPaused()) {
+        long hdop = loc->getHDOP();
+        // Poor geometry makes GPS height particularly noisy. Providers without
+        // HDOP use the satellite count; position recording continues either way.
+        bool height_ok = hdop >= 0 ? (hdop > 0 && hdop <= 30) : loc->satellitesCount() >= 4;
+        int32_t altitude = height_ok ? (int32_t)loc->getAltitude() : TrailStore::UNKNOWN_ALTITUDE_MM;
+        _trail.addPoint(la, lo, (uint32_t)rtc_clock.getCurrentTime(), md, altitude);
+      }
+    } else {
+      _trail.breakElevationSampling();
     }
   }
 

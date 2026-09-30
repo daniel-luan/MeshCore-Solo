@@ -1,4 +1,8 @@
 #include "MyMesh.h"
+#if defined(FIRMWARE_SOLO_BUILD)
+#include "RouteProtocol.h"
+#endif
+
 #include "MsgExpand.h"
 #include "GeoUtils.h"
 #include "Features.h"
@@ -1792,7 +1796,11 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
     // silently drops every incoming packet — DMs and channels included — until a slot
     // frees up.
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(32), tables),
-      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0) {
+      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0)
+#if defined(FIRMWARE_SOLO_BUILD)
+      , _route_files(store)
+#endif
+{
   _iter_started = false;
   _cli_rescue = false;
   for (int i = 0; i < RELAY_RING; i++) _relay[i].pending = false;
@@ -1890,6 +1898,15 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 
 void MyMesh::begin(bool has_display) {
   BaseChatMesh::begin();
+
+#if defined(FIRMWARE_SOLO_BUILD)
+  _route_files.begin(*_store);
+  _route_store.begin(_route_files);
+  uint32_t route_metres, route_seconds;
+  _route_files.loadSettings(route_metres, route_seconds);
+  _route_store.settings(route_metres, route_seconds);
+#endif
+
 
   if (!_store->loadMainIdentity(self_id)) {
     self_id = radio_new_identity(); // create new random identity
@@ -2066,6 +2083,16 @@ bool MyMesh::setChannelLocal(uint8_t idx, const ChannelDetails& ch) {
 }
 
 void MyMesh::handleCmdFrame(size_t len) {
+#if defined(FIRMWARE_SOLO_BUILD)
+  if (len && cmd_frame[0] == routes::COMMAND) {
+    if (_ui && !_serial->isBLEConnected() && len == 19 && cmd_frame[1] == 'S' && cmd_frame[2] == 'R'
+        && cmd_frame[3] == routes::PROTOCOL && cmd_frame[4] == routes::BEGIN && !_route_store.following()
+        && !_route_store.working()) _ui->showStorageBusyNow(StorageActivity::RouteImport);
+    size_t n = routes::handle(_route_store, _serial->isBLEConnected(), cmd_frame, len, out_frame, millis());
+    if (n) _serial->writeFrame(out_frame, n); else writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+    return;
+  }
+#endif
   if (cmd_frame[0] == CMD_DEVICE_QUERY && len >= 2) { // sent when app establishes connection
     app_target_ver = cmd_frame[1];                    // which version of protocol does app understand
 
@@ -3420,6 +3447,12 @@ void MyMesh::checkSerialInterface() {
 
 void MyMesh::loop() {
   BaseChatMesh::loop();
+#if defined(FIRMWARE_SOLO_BUILD)
+  {
+    ScopedDeviceTiming timing(DeviceTiming::ROUTE_VERIFY);
+    _route_store.step(millis());
+  }
+#endif
 
   // APC: a tracked channel/flood send that no repeater echoed within the window is
   // treated as a lost confirmation → ramp power up (lets channel sends recover).

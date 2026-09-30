@@ -13,7 +13,7 @@ class ToolsScreen : public UIScreen {
   UITask* _task;
 
   enum Action {
-    ACT_NEARBY, ACT_LIVESHARE, ACT_TRAIL, ACT_LOCATOR, ACT_COMPASS,
+    ACT_NEARBY, ACT_LIVESHARE, ACT_TRAIL, ACT_ROUTES, ACT_LOCATOR, ACT_COMPASS,
     ACT_BOT, ACT_AUTOADVERT, ACT_REPEATER, ACT_ADMIN,
     ACT_CLOCK, ACT_RINGTONE, ACT_DIAGNOSTICS
 #if defined(PIN_GPIO1)
@@ -51,6 +51,9 @@ class ToolsScreen : public UIScreen {
     switch (a) {
       case ACT_NEARBY:      _task->gotoNearbyScreen();      break;
       case ACT_LIVESHARE:   _task->gotoLiveShareScreen();   break;
+#ifdef FIRMWARE_SOLO_BUILD
+      case ACT_ROUTES: _task->gotoRoutesScreen(); break;
+#endif
       case ACT_TRAIL:       _task->gotoTrailScreen();       break;
       case ACT_LOCATOR:     _task->gotoLocatorScreen();     break;
       case ACT_COMPASS:     _task->gotoCompassScreen();     break;
@@ -125,6 +128,9 @@ public:
 const ToolsScreen::Tool ToolsScreen::LOCATION_TOOLS[] = {
   { "Nodes", &ICON_MAP_CONTACT,  ACT_NEARBY },
   { "Live Share",   &ICON_GPS,          ACT_LIVESHARE },
+#ifdef FIRMWARE_SOLO_BUILD
+  { "Routes", &ICON_TRAIL, ACT_ROUTES },
+#endif
   { "Trail",        &ICON_TRAIL,        ACT_TRAIL },
   { "Locator",    &ICON_MAP_WAYPOINT, ACT_LOCATOR },
   { "Compass",      &ICON_MAP_NORTH,    ACT_COMPASS },
@@ -144,7 +150,7 @@ const ToolsScreen::Tool ToolsScreen::SYSTEM_TOOLS[] = {
 #endif
 };
 const ToolsScreen::Section ToolsScreen::SECTIONS[] = {
-  { "Location", &ICON_MAP_CONTACT, LOCATION_TOOLS, 5 },
+  { "Location", &ICON_MAP_CONTACT, LOCATION_TOOLS, sizeof(LOCATION_TOOLS) / sizeof(LOCATION_TOOLS[0]) },
   { "Comms",    &ICON_ADVERT,      COMMS_TOOLS,    4 },
   { "System",   &ICON_GEAR,        SYSTEM_TOOLS,   (uint8_t)(sizeof(SYSTEM_TOOLS)/sizeof(SYSTEM_TOOLS[0])) },
 };

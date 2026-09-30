@@ -1,6 +1,6 @@
 #pragma once
 // GPS trail viewer. Tools › Trail.
-// Three live views — Summary, Map, List — cyclable with LEFT/RIGHT.
+// Four live views — Summary, Map, Elevation, List — cyclable with LEFT/RIGHT.
 // All settings and actions live in the Hold-Enter popup so a short Enter never
 // accidentally stops tracking.
 // Included by UITask.cpp after Trail store + ToolsScreen.
@@ -50,7 +50,7 @@ class TrailScreen : public UIScreen {
   UITask*     _task;
   TrailStore* _store;
 
-  enum View { V_SUMMARY = 0, V_MAP = 1, V_LIST = 2, V_COUNT };
+  enum View { V_SUMMARY = 0, V_MAP = 1, V_ELEVATION = 2, V_LIST = 3, V_COUNT };
   uint8_t _view           = V_SUMMARY;
   int     _summary_scroll = 0;
   int     _list_scroll    = 0;
@@ -92,7 +92,7 @@ class TrailScreen : public UIScreen {
   char      _act_autosave_label[24];
   char      _act_toggle_label[20];
 
-  static const int SUMMARY_ITEM_COUNT = 5;
+  static const int SUMMARY_ITEM_COUNT = 10;
 
 public:
   TrailScreen(UITask* task, TrailStore* store)
@@ -128,6 +128,7 @@ public:
     // for content.
     const char* base = (_view == V_MAP)  ? (_map_grid ? "TRAIL MAP+" : "TRAIL MAP")
                      : (_view == V_LIST) ? "TRAIL LIST"
+                     : (_view == V_ELEVATION) ? "ELEVATION"
                      :                      "TRAIL";
     char title[20];
     snprintf(title, sizeof(title), "%s %d/%d", base, (int)_view + 1, (int)V_COUNT);
@@ -135,6 +136,7 @@ public:
 
     if      (_view == V_MAP)  renderMap(display);
     else if (_view == V_LIST) renderList(display);
+    else if (_view == V_ELEVATION) renderElevation(display);
     else                       renderSummary(display);
 
     if (_action_menu.active) _action_menu.render(display);
@@ -502,10 +504,10 @@ private:
   void formatAvgPaceOrSpeed(char* buf, size_t n, NodePrefs* p) const {
     bool imperial = p && p->units_imperial;
     bool pace     = p && p->trail_show_pace;
-    uint16_t kmh  = _store->avgSpeedKmh();
+    float kmh = _store->avgSpeedKmh();
     if (!pace) {
-      if (imperial) snprintf(buf, n, "Avg: %u mph", (unsigned)((float)kmh * 0.621371f + 0.5f));
-      else          snprintf(buf, n, "Avg: %u km/h", (unsigned)kmh);
+      if (imperial) snprintf(buf, n, "Avg: %.1f mph", kmh * 0.621371f);
+      else          snprintf(buf, n, "Avg: %.1f km/h", kmh);
       return;
     }
     uint32_t d_m  = _store->totalDistanceMeters();
@@ -555,9 +557,87 @@ private:
       case 4:
         formatAvgPaceOrSpeed(buf, n, _task->getNodePrefs());
         break;
+      case 5:
+        formatHeight(buf, n, "Alt", _store->currentAltitudeMeters(),
+                     _store->currentAltitudeMeters() != TrailStore::UNKNOWN_ALTITUDE);
+        break;
+      case 6:
+        formatHeight(buf, n, "Ascent", _store->ascentMeters(), _store->hasElevation());
+        break;
+      case 7:
+        formatHeight(buf, n, "Descent", _store->descentMeters(), _store->hasElevation());
+        break;
+      case 8:
+        formatHeight(buf, n, "Min alt", _store->minAltitudeMeters(), _store->hasElevation());
+        break;
+      case 9:
+        formatHeight(buf, n, "Max alt", _store->maxAltitudeMeters(), _store->hasElevation());
+        break;
       default:
         buf[0] = '\0';
     }
+  }
+
+  void formatHeight(char* buf, size_t n, const char* label, float metres, bool valid) const {
+    if (!valid) { snprintf(buf, n, "%s: --", label); return; }
+    snprintf(buf, n, "%s: %ld %s", label,
+             (long)lroundf(useImperial() ? metres * 3.28084f : metres), useImperial() ? "ft" : "m");
+  }
+
+  void renderElevation(DisplayDriver& display) {
+    int low = INT16_MAX, high = INT16_MIN, known = 0;
+    float distance = 0;
+    int count = _store->profileCount();
+    for (int i = 0; i < count; ++i) {
+      const TrailPoint& p = _store->profileAt(i);
+      if (p.altitude_m != TrailStore::UNKNOWN_ALTITUDE) {
+        if (p.altitude_m < low) low = p.altitude_m;
+        if (p.altitude_m > high) high = p.altitude_m;
+        ++known;
+      }
+      if (i && !(p.flags & TRAIL_FLAG_SEG_START)) {
+        const TrailPoint& prev = _store->profileAt(i - 1);
+        distance += TrailStore::haversineMeters(prev.lat_1e6, prev.lon_1e6, p.lat_1e6, p.lon_1e6);
+      }
+    }
+    const int top = display.listStart();
+    const int step = display.lineStep();
+    if (known < 2 || distance <= 0) {
+      display.drawTextCentered(display.width() / 2, top + step, "No elevation data");
+      return;
+    }
+    // A flat trail gets a ten-metre vertical range rather than magnified jitter.
+    if (high - low < 10) { int middle = (high + low) / 2; low = middle - 5; high = middle + 5; }
+    char range[32];
+    snprintf(range, sizeof(range), "%ld .. %ld %s",
+             (long)lroundf(useImperial() ? low * 3.28084f : low),
+             (long)lroundf(useImperial() ? high * 3.28084f : high), useImperial() ? "ft" : "m");
+    display.setCursor(2, top); display.print(range);
+    const int left = 3, right = display.width() - 4;
+    const int graph_top = top + step, bottom = display.height() - step - 3;
+    if (bottom <= graph_top) return;
+    gfx::drawLine(display, left, graph_top, left, bottom);
+    gfx::drawLine(display, left, bottom, right, bottom);
+    float travelled = 0;
+    bool connected = false;
+    int prev_x = left, prev_y = bottom;
+    for (int i = 0; i < count; ++i) {
+      const TrailPoint& p = _store->profileAt(i);
+      if (i && !(p.flags & TRAIL_FLAG_SEG_START)) {
+        const TrailPoint& prev = _store->profileAt(i - 1);
+        travelled += TrailStore::haversineMeters(prev.lat_1e6, prev.lon_1e6, p.lat_1e6, p.lon_1e6);
+      }
+      if (p.altitude_m == TrailStore::UNKNOWN_ALTITUDE) { connected = false; continue; }
+      int x = left + (int)lroundf(travelled / distance * (right - left));
+      int y = bottom - (int)lroundf((p.altitude_m - low) / (float)(high - low) * (bottom - graph_top));
+      if (connected && !(p.flags & TRAIL_FLAG_SEG_START)) gfx::drawLine(display, prev_x, prev_y, x, y);
+      else display.fillRect(x, y, 1, 1);
+      prev_x = x; prev_y = y; connected = true;
+    }
+    char length[16];
+    geo::fmtDist(length, sizeof(length), distance / 1000.0f, useImperial());
+    display.setCursor(left, bottom + 2); display.print("0");
+    display.setCursor(right - display.getTextWidth(length), bottom + 2); display.print(length);
   }
 
   void renderSummary(DisplayDriver& display) {
