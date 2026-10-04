@@ -218,6 +218,8 @@ function flatten(segments) {
   return points;
 }
 export function convert(path, waypoints = [], options = {}) {
+  const progress = (message) => options.onProgress?.(message);
+  progress("Validating coordinates and elevation");
   for (const p of path.segments.flat().concat(waypoints))
     if (
       !Number.isFinite(p.lat) ||
@@ -230,13 +232,18 @@ export function convert(path, waypoints = [], options = {}) {
       throw Error("Invalid coordinates or elevation.");
   if (path.segments.some((s) => s.length < 2))
     throw Error("Each route segment needs at least two points.");
+  progress("Calculating source distances");
   const original = flatten(path.segments);
   let selected = waypoints.concat(
     options.namedCheckpoints === false ? [] : original.filter((p) => p.name),
   );
+  progress(
+    `Associating ${selected.length} checkpoints with ${original.length} points`,
+  );
   let cp = associate(original, selected);
   const horizontal = Number(options.horizontal) || 0,
     vertical = Number(options.vertical) || 0;
+  progress("Simplifying geometry (or preserving all points)");
   const segments = path.segments.map((s, seg) => {
     const first = original.findIndex((p) => p.segment === seg);
     const pinned = cp
@@ -245,6 +252,7 @@ export function convert(path, waypoints = [], options = {}) {
     return simplifySegment(s, horizontal, vertical, pinned);
   });
   const points = flatten(segments);
+  progress("Calculating final distances and checkpoint offsets");
   cp = associate(points, selected);
   // Preview represents segment boundaries and elevation gaps, never adds a connecting leg.
   const required = new Set([0, points.length - 1]);
@@ -279,6 +287,7 @@ export function convert(path, waypoints = [], options = {}) {
       heightGap: skipped.some((p) => p.alt === null),
     };
   });
+  progress("Building the spatial index and preview");
   const pages = [];
   for (let first = 0; first < points.length; first += 64) {
     const count = Math.min(64, points.length - first),
@@ -329,6 +338,7 @@ export function convert(path, waypoints = [], options = {}) {
     bytes = indexOffset + pages.length * PAGE;
   if (bytes > 0xffffffff - 20 || points.at(-1).distance > 0xffffffff)
     throw Error("This route exceeds the format address range.");
+  progress(`Serializing ${bytes} bytes and calculating checksum`);
   const data = new Uint8Array(bytes),
     v = new DataView(data.buffer);
   const u16 = (o, n) => v.setUint16(o, n, true),

@@ -10,11 +10,12 @@ class RoutesScreen : public UIScreen {
   int _scroll = 0;
   PopupMenu _menu;
   char _distanceLabel[32], _delayLabel[32];
-  enum Action { FORWARD, REVERSE, STOP, REJOIN, NEXT, OFF_DISTANCE, OFF_DELAY, DELETE };
+  enum Action { VIEW, FORWARD, REVERSE, STOP, REJOIN, NEXT, OFF_DISTANCE, OFF_DELAY, DELETE };
   routes::RouteStore &store() { return the_mesh.routeStore(); }
   void menus() {
     _confirm = 0;
     _menu.begin("Route actions");
+    _menu.addItem("View route (no GPS)");
     _menu.addItem("Start forward");
     _menu.addItem("Start reverse");
     _menu.addItem("Stop navigation");
@@ -70,7 +71,7 @@ class RoutesScreen : public UIScreen {
         break;
       default:
         snprintf(value, sizeof(value), "%s",
-                 store().following() ? "Navigation active" : "Hold Enter to start");
+                 store().following() ? "Navigation active" : "Enter: view route");
         break;
       }
       d.drawTextEllipsized(2, d.listStart() + i * d.lineStep(), d.width() - 4, value);
@@ -169,7 +170,7 @@ class RoutesScreen : public UIScreen {
       py = y;
     }
     int32_t lat, lon;
-    if (_task->currentLocation(lat, lon)) {
+    if (r.following() && r.goodFix() && _task->getGPSState() && _task->currentLocation(lat, lon)) {
       int x, y;
       project(lat, lon, x, y);
       d.drawRect(x - 2, y - 2, 5, 5);
@@ -281,7 +282,11 @@ public:
       row(d, 0, "Checking route");
     else if (r.working())
       row(d, 0, r.state() == routes::RECEIVING ? "Importing route" : "Verifying route");
-    else if (!r.hasRoute()) {
+    else if (r.state() == routes::FAILED && !r.hasRoute()) {
+      row(d, 0, "Route import failed");
+      row(d, 1, r.errorMessage());
+      row(d, 2, "Check browser log");
+    } else if (!r.hasRoute()) {
       row(d, 0, "No saved route");
       row(d, 1, "Import over USB");
     } else
@@ -350,6 +355,14 @@ public:
         return true;
       }
       switch (selected) {
+      case VIEW:
+        if (!r.hasRoute() || r.working()) {
+          _task->showAlert("Route not ready", 1500);
+          break;
+        }
+        _view = 2;
+        _scroll = 0;
+        break;
       case FORWARD:
         start(false);
         break;
@@ -405,6 +418,11 @@ public:
       return true;
     }
     if (key == KEY_ENTER) {
+      if (_view == 0 && r.hasRoute() && !r.working()) {
+        _view = 2;
+        _scroll = 0;
+        return true;
+      }
       _task->showAlert("Hold Enter for menu", 1000);
       return true;
     }

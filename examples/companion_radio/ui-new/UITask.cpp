@@ -3237,6 +3237,11 @@ void UITask::loop() {
       notify(UIEventType::ack);
       showAlert("Off planned route", 5000);
     }
+    static bool route_failure_shown = false;
+    if (route.state() == routes::FAILED) {
+      if (!route_failure_shown && _display && _display->isOn()) showAlert(route.errorMessage(), 8000);
+      route_failure_shown = true;
+    } else route_failure_shown = false;
     if (route.working()) setStorageBusy(true, route.state() == routes::RECEIVING ? StorageActivity::RouteImport : StorageActivity::RouteVerify);
     else if (_storage_activity == StorageActivity::RouteImport || _storage_activity == StorageActivity::RouteVerify) setStorageBusy(false);
   }

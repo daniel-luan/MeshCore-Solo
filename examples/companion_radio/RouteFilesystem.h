@@ -40,7 +40,25 @@ public:
       _reader = _store->openRead(_fs, path(slot));
       _readSlot = slot;
     }
-    return _reader && _reader.seek(offset) && _reader.read(dest, n) == (int)n;
+    if (!_reader || !_reader.seek(offset)) return false;
+#if defined(NRF52_PLATFORM)
+    // LittleFS can bypass its cache for large reads. After copying an unaligned
+    // file prefix, that path passes an unaligned destination to QSPI EasyDMA,
+    // which rejects it. Route labels make preview/index offsets byte-aligned.
+    // Keep each read below read_size so DMA always uses LittleFS's aligned cache.
+    const auto *config = _fs->_getFS()->cfg;
+    if (!config || config->read_size < 2) return false;
+    const size_t limit = config->read_size > 128 ? 128 : config->read_size - 1;
+    while (n) {
+      const size_t chunk = n < limit ? n : limit;
+      if (_reader.read(dest, chunk) != (int)chunk) return false;
+      dest += chunk;
+      n -= chunk;
+    }
+    return true;
+#else
+    return _reader.read(dest, n) == (int)n;
+#endif
   }
   bool create(uint8_t slot) override {
     ScopedDeviceTiming timing(DeviceTiming::ROUTE_IO);

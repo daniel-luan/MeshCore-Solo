@@ -11,7 +11,8 @@ class RouteStore {
   State _state = CHECKING;
   Error _error = OK;
   bool _boot = true, _following = false, _reverse = false;
-  uint8_t _phase = 0, _bootSlot = 0;
+  uint8_t _phase = 0, _bootSlot = 0, _failurePhase = 0;
+  uint32_t _failureCursor = 0;
   uint32_t _generation = 0, _candidateGeneration = 0, _expectedCrc = 0, _crc = 0xffffffff;
   uint32_t _position = 0, _cursor = 0, _child = 0, _segments = 0, _lastDistance = 0, _lastSegmentStart = 0;
   uint32_t _session = 0, _received = 0, _uploadBytes = 0, _uploadCrc = 0, _lastActivity = 0;
@@ -63,6 +64,8 @@ class RouteStore {
     return true;
   }
   void failed(Error error) {
+    _failurePhase = _phase;
+    _failureCursor = _phase == 8 ? _child : _cursor;
     _files->cancel();
     _error = error;
     _phase = 0;
@@ -221,6 +224,38 @@ public:
   }
   State state() const { return _state; }
   Error error() const { return _error; }
+  uint8_t diagnosticPhase() const { return _error == OK ? _phase : _failurePhase; }
+  uint32_t diagnosticCursor() const { return _error == OK ? _cursor : _failureCursor; }
+  uint32_t diagnosticPosition() const { return _position; }
+  uint32_t diagnosticExpectedCrc() const { return _expectedCrc; }
+  uint32_t diagnosticActualCrc() const { return ~_crc; }
+  const char *errorMessage() const {
+    if (_error == IO_ERROR) return "Route storage error";
+    if (_error == NO_SPACE) return "Route storage full";
+    if (_error == BAD_SESSION) return "Upload timed out";
+    switch (_failurePhase) {
+    case 1:
+      return "Invalid route header";
+    case 2:
+    case 10:
+    case 13:
+      return "Route commit failed";
+    case 3:
+      return "Checksum mismatch";
+    case 4:
+      return "Invalid route points";
+    case 5:
+    case 14:
+      return "Invalid checkpoint";
+    case 6:
+      return "Invalid preview";
+    case 7:
+    case 8:
+      return "Invalid route index";
+    default:
+      return "Route import failed";
+    }
+  }
   bool hasRoute() const { return _active >= 0; }
   bool following() const { return _following; }
   bool reverse() const { return _reverse; }
@@ -594,6 +629,8 @@ public:
       uint32_t n = _header.previews - _previewLoaded;
       if (n > 32) n = 32;
       if (!read(_header.previewOffset + _previewLoaded * POINT_SIZE, _scratch, n * POINT_SIZE)) {
+        _failurePhase = _phase;
+        _failureCursor = _previewLoaded;
         _active = -1;
         _phase = 0;
         _state = FAILED;

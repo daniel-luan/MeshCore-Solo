@@ -1,5 +1,6 @@
 import { parseGpxDocument } from "./format.mjs";
 import { RouteSerial, OP, integers } from "./serial.mjs";
+import { ActivityLog } from "./log.mjs";
 const container = document.createElement("section");
 container.id = "route-import";
 container.className = "card";
@@ -18,6 +19,16 @@ document.body.style.margin = "auto";
 exportCard.style.maxWidth = "none";
 container.style.maxWidth = "none";
 document.body.append(container);
+const log = new ActivityLog(document.body);
+window.gpxLog = (message, level = "info") => log.write(message, level);
+window.gpxActivity = (message) => log.phase(message);
+window.gpxFinished = (message, level = "info") => log.finish(message, level);
+window.addEventListener("error", (e) =>
+  log.finish(`Page error: ${e.message} (${e.filename}:${e.lineno})`, "error"),
+);
+window.addEventListener("unhandledrejection", (e) =>
+  log.finish(`Unhandled error: ${e.reason?.stack || e.reason}`, "error"),
+);
 const tabs = document.createElement("nav");
 tabs.style.marginBottom = "1rem";
 tabs.innerHTML =
@@ -34,7 +45,13 @@ let gpx = null,
   cancel = false,
   connecting = false,
   converting = false,
-  conversion = 0;
+  conversion = 0,
+  conversionStarted = 0;
+log.detail = () => {
+  if (!client) return "";
+  const pending = client.pending;
+  return `${client.closed ? "USB closed" : "USB open"}: RX ${client.rxBytes} B / TX ${client.txBytes} B; ${client.frames} frames; ${client.ignoredFrames} ignored; ${client.noiseBytes} non-frame bytes${pending ? `; waiting for ${pending.name} #${pending.id}, attempt ${pending.attempt}/4, ${((performance.now() - pending.started) / 1000).toFixed(1)}s` : client.lastReply ? `; last reply ${((performance.now() - client.lastReply) / 1000).toFixed(1)}s ago` : "; no reply yet"}`;
+};
 const worker = new Worker(new URL("./worker.mjs", import.meta.url), {
   type: "module",
 });
@@ -91,11 +108,21 @@ $("route-file").onchange = async () => {
   controls();
   try {
     if (!file) return;
+    log.phase(`Reading ${file.name} (${file.size} bytes)`);
     status("Reading GPX on this computer…");
     const xml = await file.text();
     if (fileId !== conversion) return;
+    log.phase(`Parsing GPX XML (${xml.length} characters)`);
+    await new Promise((r) => setTimeout(r, 0));
+    if (fileId !== conversion) return;
     const doc = new DOMParser().parseFromString(xml, "application/xml");
+    log.phase("Inspecting GPX tracks, segments and waypoints");
+    await new Promise((r) => setTimeout(r, 0));
+    if (fileId !== conversion) return;
     gpx = parseGpxDocument(doc);
+    log.write(
+      `GPX parsed: ${gpx.paths.length} tracks/routes, ${gpx.waypoints.length} waypoints`,
+    );
     $("route-path").replaceChildren(
       ...gpx.paths.map((p, i) => {
         const o = document.createElement("option");
@@ -126,6 +153,7 @@ $("route-file").onchange = async () => {
     gpx = null;
     route = null;
     $("route-path").replaceChildren();
+    log.finish(e.stack || e.message, "error");
     status(e.message);
     controls();
   }
@@ -139,6 +167,11 @@ function rebuild() {
   converting = true;
   route = null;
   controls();
+  conversionStarted = performance.now();
+  const path = gpx.paths[Number($("route-path").value)];
+  log.phase(
+    `Converting "${path.name}" (${path.segments.length} segments); horizontal tolerance ${$("route-tolerance").value}m, elevation tolerance ${$("route-height").value}m`,
+  );
   status("Converting route on this computer…");
   worker.postMessage({
     id: ++conversion,
@@ -153,7 +186,14 @@ function rebuild() {
     },
   });
 }
-worker.onmessage = ({ data }) => {
+worker.onmessage = async ({ data }) => {
+  if (data.id !== conversion) return;
+  if (data.progress) {
+    log.phase(data.progress);
+    return;
+  }
+  log.phase("Rendering route preview and checkpoint list");
+  await new Promise((r) => setTimeout(r, 0));
   if (data.id !== conversion) return;
   converting = false;
   try {
@@ -179,6 +219,9 @@ worker.onmessage = ({ data }) => {
       }),
     );
     draw(route);
+    log.finish(
+      `Conversion complete: ${route.points.length}/${route.originalPoints} points, ${route.checkpoints.length} checkpoints, ${route.data.length} bytes, CRC32 0x${route.crc.toString(16).padStart(8, "0")}; total ${((performance.now() - conversionStarted) / 1000).toFixed(2)}s`,
+    );
     status(
       client && route.data.length > maximum
         ? "This converted route exceeds available storage. Simplify or select another track. The route will not be truncated."
@@ -186,12 +229,14 @@ worker.onmessage = ({ data }) => {
     );
   } catch (e) {
     route = null;
+    log.finish(e.stack || e.message, "error");
     status(e.message);
   }
   controls();
 };
 worker.onerror = (e) => {
   converting = false;
+  log.finish(`Conversion worker failed: ${e.message}`, "error");
   status(e.message);
   controls();
 };
@@ -224,6 +269,31 @@ function draw(r) {
   }
   ctx.stroke();
 }
+function verificationDetails(reply) {
+  if (reply.body.length < 23 || reply.body[5] !== 0xd1) return "";
+  const v = new DataView(
+    reply.body.buffer,
+    reply.body.byteOffset,
+    reply.body.byteLength,
+  );
+  const stages = {
+    0: "idle",
+    1: "header",
+    2: "saved completion footer",
+    3: "payload checksum",
+    4: "route points",
+    5: "checkpoints",
+    6: "preview geometry",
+    7: "index pages",
+    8: "index relationships/bounds",
+    10: "writing completion footer",
+    11: "loading preview",
+    13: "reading completion footer back",
+    14: "checkpoint association",
+  };
+  const phase = reply.body[6];
+  return `stage=${stages[phase] || phase} (${phase}), record=${v.getUint32(7, true)}, scanned bytes=${v.getUint32(11, true)}, expected CRC=0x${v.getUint32(15, true).toString(16).padStart(8, "0")}, scanned CRC=0x${v.getUint32(19, true).toString(16).padStart(8, "0")}`;
+}
 async function capacity() {
   let result = await client.request(OP.CAPABILITIES),
     v = new DataView(
@@ -235,6 +305,9 @@ async function capacity() {
   maximum = v.getUint32(18, true);
   $("route-capacity").textContent =
     `Available for replacement: ${bytes(maximum)}. Total filesystem: ${bytes(v.getUint32(2, true))}; allocated: ${bytes(v.getUint32(6, true))}; reserved: ${bytes(v.getUint32(10, true))}; reclaimable inactive slot: ${bytes(v.getUint32(14, true))}.`;
+  log.write(
+    `Capacity: total=${v.getUint32(2, true)}, used=${v.getUint32(6, true)}, reserve=${v.getUint32(10, true)}, inactive reclaim=${v.getUint32(14, true)}, upload maximum=${maximum} bytes; chunk=${chunk}`,
+  );
   controls();
 }
 $("route-connect").onclick = async () => {
@@ -249,11 +322,32 @@ $("route-connect").onclick = async () => {
     if (!navigator.serial)
       throw Error("Use desktop Chrome over HTTPS or localhost.");
     await window.disconnectGpxExport?.();
-    client = new RouteSerial(await navigator.serial.requestPort());
+    log.phase("Waiting for USB port selection");
+    const port = await navigator.serial.requestPort();
+    log.write(`Selected USB port: ${JSON.stringify(port.getInfo?.() || {})}`);
+    log.phase("Connecting to device");
+    client = new RouteSerial(port, {
+      onLog: (message, level) => log.write(message, level),
+      verbose: () => log.verbose(),
+    });
     await client.open();
     $("route-connect").textContent = "Disconnect";
+    log.phase("Querying device route status");
+    let previousCheck = -1,
+      lastRouteStatus = null;
     for (;;) {
       const s = await client.request(OP.STATUS, new Uint8Array(), 0);
+      lastRouteStatus = s;
+      const percent = new DataView(s.body.buffer, s.body.byteOffset).getUint32(
+        0,
+        true,
+      );
+      if (percent !== previousCheck) {
+        log.write(
+          `Boot verification: state=${s.state}, checksum scan=${percent}%, error=${s.body[4]}, ${verificationDetails(s)}`,
+        );
+        previousCheck = percent;
+      }
       if (s.state !== 0) break;
       status(
         `Checking saved route: ${new DataView(s.body.buffer, s.body.byteOffset).getUint32(0, true)}%`,
@@ -267,7 +361,13 @@ $("route-connect").onclick = async () => {
         `Device route: ${new TextDecoder().decode(info.body.subarray(21, 21 + info.body[20]))}`,
       );
     else status("Device ready.");
+    if (lastRouteStatus?.state === 5) {
+      const message = `Previous route import failed (error ${lastRouteStatus.body[4]}${verificationDetails(lastRouteStatus) ? `; ${verificationDetails(lastRouteStatus)}` : ""}). ${info.body.length ? "Previous saved route remains available." : "No saved route is active."}`;
+      status(message);
+      log.finish(message, "warn");
+    } else log.finish("Device connected and ready for import");
   } catch (e) {
+    log.finish(e.stack || e.message, "error");
     status(e.message);
     await disconnect();
   } finally {
@@ -277,12 +377,21 @@ $("route-connect").onclick = async () => {
 };
 $("route-cancel").onclick = () => {
   cancel = true;
+  log.write(
+    "Cancellation requested; waiting for the current USB request",
+    "warn",
+  );
   status("Cancelling after the current request…");
 };
 $("route-upload").onclick = async () => {
   uploading = true;
   cancel = false;
   controls();
+  const uploadStarted = performance.now();
+  let lastProgress = uploadStarted;
+  log.phase(
+    `Starting upload: ${route.data.length} bytes, CRC32 0x${route.crc.toString(16).padStart(8, "0")}`,
+  );
   try {
     const start = await client.request(
       OP.BEGIN,
@@ -290,6 +399,9 @@ $("route-upload").onclick = async () => {
       0,
     );
     client.session = start.session;
+    log.phase(
+      `Transferring route (session ${start.session}, chunk size ${chunk} bytes)`,
+    );
     let offset = start.next;
     while (offset < route.data.length) {
       if (cancel) throw Error("Import cancelled.");
@@ -304,29 +416,84 @@ $("route-upload").onclick = async () => {
       if (reply.next !== offset + data.length)
         throw Error("Unexpected transfer offset.");
       offset = reply.next;
+      const now = performance.now();
+      if (now - lastProgress >= 1000 || offset === route.data.length) {
+        const seconds = Math.max((now - uploadStarted) / 1000, 0.001),
+          rate = offset / seconds;
+        log.write(
+          `Upload: ${offset}/${route.data.length} bytes (${((offset * 100) / route.data.length).toFixed(1)}%); ${rate.toFixed(0)} B/s; estimated ${Math.ceil((route.data.length - offset) / Math.max(rate, 1))}s remaining`,
+        );
+        lastProgress = now;
+      }
       status(`Importing: ${bytes(offset)} / ${bytes(route.data.length)}`);
     }
     if (cancel) throw Error("Import cancelled.");
+    log.phase("Committing uploaded route and starting device verification");
     await client.request(OP.COMMIT);
+    log.phase("Waiting for route verification and activation");
+    let previousVerify = "";
     for (;;) {
       if (cancel) throw Error("Import cancelled.");
       const s = await client.request(OP.STATUS);
+      const progress = new DataView(s.body.buffer, s.body.byteOffset).getUint32(
+        0,
+        true,
+      );
+      const details = verificationDetails(s);
+      const key = `${s.state}/${progress}/${s.body[4]}/${s.body[6] ?? ""}`;
+      if (key !== previousVerify) {
+        log.write(
+          `Verification: state=${s.state}, checksum scan=${progress}%, error=${s.body[4]}, next=${s.next}, ${details}`,
+        );
+        previousVerify = key;
+      }
       if (s.state === 1) break;
       if (s.state === 5 || s.body[4])
-        throw Error("Route verification failed. Previous route is retained.");
+        throw Error(
+          `Route verification failed (error ${s.body[4]}${details ? `; ${details}` : ""}). Any previous saved route is retained.`,
+        );
       status(
-        `Verifying route: ${new DataView(s.body.buffer, s.body.byteOffset).getUint32(0, true)}%`,
+        progress === 100
+          ? "Checksum scan complete; device is validating route sections and index…"
+          : `Verifying route: ${progress}%`,
       );
       await new Promise((r) => setTimeout(r, 100));
     }
+    const saved = await client.request(OP.INFO);
+    if (saved.body.length < 21)
+      throw Error(
+        "Device reported completion but no saved route metadata. Download this log.",
+      );
+    const savedView = new DataView(
+      saved.body.buffer,
+      saved.body.byteOffset,
+      saved.body.byteLength,
+    );
+    if (
+      savedView.getUint32(0, true) !== route.data.length ||
+      savedView.getUint32(4, true) !== route.points.length
+    )
+      throw Error(
+        "Device metadata does not match the uploaded route. Download this log.",
+      );
+    log.write(
+      `Confirmed saved route: ${savedView.getUint32(0, true)} bytes, ${savedView.getUint32(4, true)} points`,
+    );
     status("Route imported and verified. Open Tools → Location → Routes.");
     await capacity();
+    log.finish(
+      `Route imported and activated in ${((performance.now() - uploadStarted) / 1000).toFixed(1)}s`,
+    );
   } catch (e) {
+    log.write(`Upload stopped: ${e.message}`, "error");
     if (client?.session) {
       try {
         await client.request(OP.ABORT);
-      } catch {}
+      } catch (abortError) {
+        log.write(`ABORT reply: ${abortError.message}`, "warn");
+      }
     }
+    log.finish(e.stack || e.message, "error");
     status(e.message);
   } finally {
     uploading = false;
@@ -336,4 +503,5 @@ $("route-upload").onclick = async () => {
 window.addEventListener("beforeunload", () => {
   client?.close();
   worker.terminate();
+  log.destroy();
 });

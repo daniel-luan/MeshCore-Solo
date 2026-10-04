@@ -80,7 +80,14 @@ inline size_t handle(RouteStore &store, bool ble, const uint8_t *in, size_t len,
         error = BAD_SESSION;
       put32(out + 17, store.verifyProgress());
       out[21] = store.error();
-      extra = 5;
+      // Optional diagnostics trailer; the original five-byte body remains intact.
+      out[22] = 0xd1;
+      out[23] = store.diagnosticPhase();
+      put32(out + 24, store.diagnosticCursor());
+      put32(out + 28, store.diagnosticPosition());
+      put32(out + 32, store.diagnosticExpectedCrc());
+      put32(out + 36, store.diagnosticActualCrc());
+      extra = 23;
       break;
     case COMMIT:
       error = len == 11 ? store.commit(token, now) : BAD_REQUEST;

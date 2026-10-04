@@ -1,6 +1,10 @@
 # Planned routes
 
-Solo supports one saved hiking route independently of trail recording. Open **Tools → Location → Routes**. Left/right selects Overview, Navigate, Route View, Elevation, or Checkpoints; up/down scrolls the overview or checkpoints. Hold Enter for route actions: forward/reverse, stop, rejoin, next segment, alert settings, and confirmed deletion.
+Solo supports one saved hiking route independently of trail recording. Open **Tools → Location → Routes**. Left/right selects Overview, Navigate, Route View, Elevation, or Checkpoints; up/down scrolls the overview or checkpoints. Hold Enter for route actions: view route, forward/reverse, stop, rejoin, next segment, alert settings, and confirmed deletion.
+
+## Preview without GPS
+
+Press Enter on the overview, or hold Enter and choose **View route (no GPS)**, to open the saved route drawing. Browse its elevation profile and checkpoints with left/right. Viewing a saved route does not enable GPS or start navigation, and works on a Heltec V4 without a GPS receiver. The position marker appears only while navigation is active with GPS enabled and a qualifying fix. If navigation is already active, viewing the route leaves it running; choose **Stop navigation** separately to stop it.
 
 ## Import from GPX
 
@@ -11,6 +15,8 @@ python3 -m http.server 8000
 ```
 
 Open `http://localhost:8000/tools/gpx-downloader/` in desktop Chrome and select **Import route**. Disconnect BLE companions and other USB applications. Select a GPX 1.0/1.1 file, choose a track/route and checkpoints, and inspect its segment boundaries. The file stays on your computer. Geometry is preserved by default; optional horizontal/elevation simplification retains endpoints, segment boundaries, and selected checkpoint legs. Missing elevation remains missing.
+
+The **Activity log** below the tabs shows conversion stages, elapsed time, upload rate, verification status, USB counters, slow replies, and retries. Enable **Detailed USB requests and replies** for request IDs, sessions, offsets, and individual replies. **Download log** saves the latest 500 entries for troubleshooting. Logs are also written to the browser console. A checksum scan at 100% still needs structural verification before activation.
 
 Connect at 115200 baud, review capacity, then import. Transfers and verification show progress; cancellation or interrupted replacement retains the previous complete route. There is no 32 KB route limit: filesystem space, reserve, overhead, and the existing route determine replacement capacity. Only the inactive slot is reclaimed automatically. To reclaim the active route, explicitly delete it on the device.
 

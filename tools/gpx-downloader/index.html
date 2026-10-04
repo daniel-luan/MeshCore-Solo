@@ -176,6 +176,7 @@ let reader     = null;
 let gpxBuffer  = '';
 let capturing  = false;
 let captured   = false;
+let nextExportLog = 0;
 
 // ---- initial state ----
 if (!('serial' in navigator)) {
@@ -189,8 +190,10 @@ resetFilename();
 $id('connectBtn').addEventListener('click', async () => {
   if (port) { await doDisconnect(); return; }
   try {
+    window.gpxActivity?.("Export: waiting for USB port selection");
     port = await navigator.serial.requestPort();
     await port.open({ baudRate: 115200 });
+    window.gpxActivity?.("Export: connected at 115200 baud; waiting for GPX from device");
     setConn(true);
     readLoop();
   } catch (e) {
@@ -200,30 +203,34 @@ $id('connectBtn').addEventListener('click', async () => {
 
 window.disconnectGpxExport = doDisconnect;
 async function doDisconnect() {
+  if (port) window.gpxLog?.("Export: closing USB connection");
   if (reader) { try { await reader.cancel(); } catch {} reader = null; }
   if (port)   { try { await port.close();    } catch {} port   = null; }
   setConn(false);
   if (!captured) resetProgress();
+  window.gpxFinished?.("Export: disconnected");
 }
 
 // ---- read loop ----
 async function readLoop() {
   const dec = new TextDecoder();
+  let ended = false;
   try {
-    while (port?.readable) {
+    while (port?.readable && !ended) {
       reader = port.readable.getReader();
+      const activeReader = reader;
       try {
         for (;;) {
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) { ended = true; window.gpxLog?.("Export: USB receive stream ended", "warn"); break; }
           processChunk(dec.decode(value, { stream: true }));
         }
       } finally {
-        reader.releaseLock();
-        reader = null;
+        activeReader.releaseLock();
+        if (reader === activeReader) reader = null;
       }
     }
-  } catch (_) {}
+  } catch (e) { window.gpxLog?.(`Export: USB read failed: ${e.message}`, "error"); }
   if (port) await doDisconnect();
 }
 
@@ -234,6 +241,7 @@ function processChunk(chunk) {
   if (!capturing) {
     const start = chunk.indexOf('<?xml');
     if (start === -1) return;
+    window.gpxActivity?.("Export: receiving GPX data");
     capturing  = true;
     gpxBuffer  = chunk.slice(start);
     setDot('receiving');
@@ -243,11 +251,16 @@ function processChunk(chunk) {
     $id('progressBox').textContent = `Receiving… ${gpxBuffer.length} B`;
   }
 
+  if (performance.now() >= nextExportLog) {
+    window.gpxLog?.(`Export: ${gpxBuffer.length} characters received`);
+    nextExportLog = performance.now() + 1000;
+  }
   const end = gpxBuffer.indexOf('</gpx>');
   if (end !== -1) {
     gpxBuffer  = gpxBuffer.slice(0, end + 6);
     capturing  = false;
     captured   = true;
+    window.gpxFinished?.(`Export complete: ${gpxBuffer.length} characters received`);
     setDot(port ? 'on' : '');
     $id('progressBox').textContent = `Done — ${gpxBuffer.length} B`;
     $id('step3').classList.remove('hidden');
@@ -299,6 +312,7 @@ function resetFilename() {
 }
 
 function showError(msg) {
+  window.gpxFinished?.(msg, "error");
   $id('progressBox').className = 'progress-box error';
   $id('progressBox').textContent = msg;
 }
